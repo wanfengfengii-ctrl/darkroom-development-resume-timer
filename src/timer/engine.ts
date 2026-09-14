@@ -8,6 +8,12 @@
  *
  * 所有时间均为 Date.now() 形式的 Unix 毫秒时间戳，不依赖任何 tick 计时，
  * 因此刷新页面或平板息屏后，已过去的阶段绝不会被重走。
+ *
+ * 多标签页：同一冲洗可能在多个标签页打开。每条持久化记录带单调递增的
+ * rev；显式操作（开始/暂停/继续/重置）提升 rev，各标签页通过 storage
+ * 事件同步。低 rev 的陈旧写入（例如另一个仍在运行的标签页的定时 tick）
+ * 不能覆盖高 rev 的暂停记录。重置写一条高 rev 的墓碑，防止旧标签页把
+ * 已放弃的会话「复活」。
  */
 
 export const STAGE_IDS = ['develop', 'stop', 'fix'] as const
@@ -57,13 +63,32 @@ export interface LockedState {
 
 export type TimerState = RunningState | PausedState | DoneState | LockedState
 
-/** 写入 localStorage 的完整结构 */
+/** 一次进行中的冲洗会话 */
 export interface PersistedState {
   version: 1
+  /** 单调版本号，跨标签页用于判定新旧，显式操作时递增 */
+  rev: number
   recipe: Recipe
   timer: TimerState
   /** 最近一次见到的墙钟时间（启动/暂停/恢复/每次 tick 都会刷新） */
   lastWallClock: number
+}
+
+/** 重置墓碑：会话已放弃，但保留更高 rev 以防陈旧标签页复活旧状态 */
+export interface ResetTombstone {
+  version: 1
+  rev: number
+  reset: true
+}
+
+export type StoredRecord = PersistedState | ResetTombstone
+
+export function isPersistedState(record: StoredRecord): record is PersistedState {
+  return !('reset' in record)
+}
+
+export function recordRev(record: StoredRecord | null): number {
+  return record ? record.rev : 0
 }
 
 export const STORAGE_KEY = 'darkroom-timer:v1'
@@ -102,14 +127,25 @@ export function initialInput(): RecipeInput {
   return { develop: '60', stop: '30', fix: '300' }
 }
 
-/** 启动：从显影开始，记录绝对截止时间 */
-export function startTimer(recipe: Recipe, now: number): PersistedState {
+/** 启动：从显影开始，记录绝对截止时间；rev 在调用方基于当前存储递增 */
+export function startTimer(recipe: Recipe, now: number, rev: number): PersistedState {
   return {
     version: 1,
+    rev,
     recipe,
     timer: { status: 'running', stage: 'develop', deadline: now + recipe.develop * 1000 },
     lastWallClock: now,
   }
+}
+
+/** 替换 rev（显式操作后调用） */
+export function withRev(state: PersistedState, rev: number): PersistedState {
+  return state.rev === rev ? state : { ...state, rev }
+}
+
+/** 构造重置墓碑 */
+export function resetTombstone(rev: number): ResetTombstone {
+  return { version: 1, rev, reset: true }
 }
 
 /**
@@ -195,27 +231,49 @@ export function pausedRemainingSeconds(timer: PausedState): number {
 
 // ---- localStorage 序列化 ----
 
-export function loadState(): PersistedState | null {
+function revive(raw: string): StoredRecord | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== 'object') return null
+  const r = parsed as Record<string, unknown>
+  if (r.version !== 1 || typeof r.rev !== 'number' || !Number.isFinite(r.rev)) return null
+  if (r.reset === true) return { version: 1, rev: r.rev, reset: true }
+  const p = parsed as Partial<PersistedState>
+  if (!p.timer || typeof p.lastWallClock !== 'number' || !p.recipe) return null
+  return p as PersistedState
+}
+
+export function loadRecord(): StoredRecord | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as PersistedState
-    if (parsed.version !== 1) return null
-    if (!parsed.timer || typeof parsed.lastWallClock !== 'number') return null
-    return parsed
+    return raw ? revive(raw) : null
   } catch {
     return null
   }
 }
 
-export function saveState(state: PersistedState | null): void {
+export function saveRecord(record: StoredRecord): void {
   try {
-    if (state === null) {
-      localStorage.removeItem(STORAGE_KEY)
-    } else {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
-    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(record))
   } catch {
     // 隐私模式等情况下静默失败；计时功能本身不依赖存储写入成功
   }
+}
+
+/**
+ * 提交一条记录：仅当候选 rev 不低于存储中现有 rev 时才写入。
+ * 这样另一个标签页里陈旧的 running tick（低 rev）不可能覆盖更新的暂停（高 rev）。
+ * 返回存储中当前最新的记录：被拒时是更高 rev 的现存记录，调用方应当采纳它。
+ */
+export function commitRecord(candidate: StoredRecord): StoredRecord {
+  const stored = loadRecord()
+  if (stored && recordRev(stored) > recordRev(candidate)) {
+    return stored
+  }
+  saveRecord(candidate)
+  return candidate
 }

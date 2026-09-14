@@ -1,15 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import {
   STAGE_IDS,
+  STORAGE_KEY,
   advance,
-  loadState,
+  commitRecord,
+  isPersistedState,
+  loadRecord,
   pauseTimer,
   pausedRemainingSeconds,
+  recordRev,
   remainingSecondsAt,
+  resetTombstone,
   resumeTimer,
-  saveState,
+  saveRecord,
   startTimer,
   validateRecipe,
+  withRev,
   type PersistedState,
   type Recipe,
 } from './engine'
@@ -18,10 +24,13 @@ const recipe: Recipe = { develop: 60, stop: 30, fix: 300 }
 const SECOND = 1000
 const T0 = 1_000_000_000_000
 
-/** 把当前持久化推进到指定阶段进行中（测试辅助） */
-function runningAt(stageIndex: number, now: number, deadline: number): PersistedState {
+afterEach(() => localStorage.removeItem(STORAGE_KEY))
+
+/** 把当前持久化推进到指定阶段进行中（测试辅助），默认 rev=1 */
+function runningAt(stageIndex: number, now: number, deadline: number, rev = 1): PersistedState {
   return {
     version: 1,
+    rev,
     recipe,
     timer: { status: 'running', stage: STAGE_IDS[stageIndex], deadline },
     lastWallClock: now - 1,
@@ -67,7 +76,8 @@ describe('validateRecipe', () => {
 
 describe('startTimer', () => {
   it('从显影开始，截止时间 = 启动墙钟 + 显影时长', () => {
-    const s = startTimer(recipe, T0)
+    const s = startTimer(recipe, T0, 1)
+    expect(s.rev).toBe(1)
     expect(s.timer).toEqual({ status: 'running', stage: 'develop', deadline: T0 + 60 * SECOND })
     expect(s.lastWallClock).toBe(T0)
   })
@@ -211,18 +221,105 @@ describe('时钟回拨保护', () => {
 
 describe('localStorage 持久化往返', () => {
   it('保存后可重新载入，结构保持不变', () => {
-    const s = startTimer(recipe, T0)
-    saveState(s)
-    const loaded = loadState()
+    const s = startTimer(recipe, T0, 1)
+    saveRecord(s)
+    const loaded = loadRecord()
     expect(loaded).toEqual(s)
+    expect(loaded && isPersistedState(loaded)).toBe(true)
   })
 
-  it('清除后载入为 null；坏数据也安全返回 null', () => {
-    saveState(null)
-    expect(loadState()).toBeNull()
-    localStorage.setItem('darkroom-timer:v1', '{not json')
-    expect(loadState()).toBeNull()
-    localStorage.setItem('darkroom-timer:v1', JSON.stringify({ version: 99 }))
-    expect(loadState()).toBeNull()
+  it('坏数据/旧版本安全返回 null', () => {
+    localStorage.setItem(STORAGE_KEY, '{not json')
+    expect(loadRecord()).toBeNull()
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ version: 99 }))
+    expect(loadRecord()).toBeNull()
+    localStorage.removeItem(STORAGE_KEY)
+    expect(loadRecord()).toBeNull()
+  })
+
+  it('空存储的 rev 视为 0', () => {
+    expect(recordRev(loadRecord())).toBe(0)
+  })
+})
+
+describe('多标签页 rev 仲裁（跨标签暂停保持）', () => {
+  it('低 rev 的陈旧 running tick 不能覆盖高 rev 的暂停记录', () => {
+    // 标签 A：运行中 rev=1
+    const running = startTimer(recipe, T0, 1)
+    expect(commitRecord(running)).toEqual(running)
+
+    // 标签 B：暂停，rev 提升到 2 并提交
+    const pausedAt = T0 + 20 * SECOND
+    const paused = withRev(pauseTimer(running, pausedAt), 2)
+    expect(paused.timer.status).toBe('paused')
+    expect(commitRecord(paused)).toEqual(paused)
+
+    // 标签 A 的定时器稍后才醒来，拿着旧 rev=1 试图把 running 写回
+    const staleTick = advance(running, T0 + 21 * SECOND) // 仍为 running，rev 仍是 1
+    const result = commitRecord(staleTick)
+
+    // 存储必须仍是暂停，绝不允许陈旧 running 覆盖
+    const stored = loadRecord()
+    expect(stored).toEqual(paused)
+    expect(result).toEqual(paused)
+    expect(isPersistedState(stored!) && stored.timer.status).toBe('paused')
+  })
+
+  it('暂停后“刷新页面”：重新载入得到的仍是暂停态，剩余毫秒不变', () => {
+    const running = startTimer(recipe, T0, 1)
+    commitRecord(running)
+    const paused = withRev(pauseTimer(running, T0 + 20 * SECOND), 2)
+    commitRecord(paused)
+
+    // 5 分钟后另一个 running 标签的 tick 与新页面加载同时发生
+    commitRecord(advance(running, T0 + 320 * SECOND)) // 低 rev，被拒
+    const loaded = loadRecord()
+    expect(loaded && isPersistedState(loaded) && loaded.timer.status).toBe('paused')
+    if (loaded && isPersistedState(loaded) && loaded.timer.status === 'paused') {
+      expect(loaded.timer.remainingMs).toBe(40 * SECOND)
+    }
+  })
+
+  it('同 rev 的运行态推进可正常提交（单标签倒计时）', () => {
+    const running = startTimer(recipe, T0, 1)
+    commitRecord(running)
+    const ticked = advance(running, T0 + 1 * SECOND)
+    expect(commitRecord(ticked)).toEqual(ticked)
+    expect(loadRecord()).toEqual(ticked)
+  })
+
+  it('继续操作以更高 rev 生效，随后的 running tick 同 rev 跟进', () => {
+    const running = startTimer(recipe, T0, 1)
+    commitRecord(running)
+    const paused = withRev(pauseTimer(running, T0 + 20 * SECOND), 2)
+    commitRecord(paused)
+
+    const resumedAt = T0 + 320 * SECOND
+    const resumed = withRev(resumeTimer(paused, resumedAt), 3)
+    expect(commitRecord(resumed)).toEqual(resumed)
+    if (resumed.timer.status === 'running') {
+      expect(resumed.timer.deadline).toBe(resumedAt + 40 * SECOND)
+    }
+  })
+
+  it('重置写高 rev 墓碑，旧 running tick 无法复活会话', () => {
+    const running = startTimer(recipe, T0, 1)
+    commitRecord(running)
+    const tomb = resetTombstone(2)
+    expect(commitRecord(tomb)).toEqual(tomb)
+
+    // 旧标签的运行 tick（rev=1）尝试写回，被墓碑拒绝
+    const stale = advance(running, T0 + 30 * SECOND)
+    expect(commitRecord(stale)).toEqual(tomb)
+    const stored = loadRecord()
+    expect(stored && 'reset' in stored).toBe(true)
+    expect(stored && isPersistedState(stored)).toBe(false)
+  })
+
+  it('墓碑之后可重新开始新一轮（rev 继续递增）', () => {
+    commitRecord(resetTombstone(2))
+    const fresh = startTimer(recipe, T0 + 1000, 3)
+    expect(commitRecord(fresh)).toEqual(fresh)
+    expect(loadRecord()).toEqual(fresh)
   })
 })

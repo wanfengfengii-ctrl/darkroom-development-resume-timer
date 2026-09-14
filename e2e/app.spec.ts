@@ -76,6 +76,7 @@ test.describe('刷新续时', () => {
     const now = Date.now()
     await seedAndReload(page, {
       version: 1,
+      rev: 1,
       recipe: { develop: 60, stop: 30, fix: 300 },
       // 截止时间在 5 秒前：显影 60s 已完全耗尽，逾期 5s 从停显 30s 中扣减
       timer: { status: 'running', stage: 'develop', deadline: now - 5_000 },
@@ -91,6 +92,7 @@ test.describe('刷新续时', () => {
     const now = Date.now()
     await seedAndReload(page, {
       version: 1,
+      rev: 1,
       recipe: { develop: 60, stop: 30, fix: 300 },
       // 100 秒前启动：显影 60 + 停显 30 已耗尽，定影剩 290 秒
       timer: { status: 'running', stage: 'develop', deadline: now - 40_000 },
@@ -151,6 +153,38 @@ test.describe('暂停 / 继续', () => {
     await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
     await expect(page.getByTestId('seconds')).toHaveText('60')
   })
+
+  test('同一冲洗在另一标签页仍开着时暂停，暂停标签刷新后仍保持暂停', async ({ context }) => {
+    // 标签 A：启动冲洗并一直开着（其 200ms tick 仍在运行）
+    const tabA = await context.newPage()
+    await tabA.goto('/')
+    await startRecipe(tabA, '60', '60', '60')
+
+    // 标签 B：打开同一冲洗（从存储恢复为运行中）
+    const tabB = await context.newPage()
+    await tabB.goto('/')
+    await expect(tabB.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(tabB.getByTestId('current-stage')).toHaveText('显影')
+
+    // 在 B 暂停
+    await tabB.getByTestId('pause-button').click()
+    await expect(tabB.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+    await expect(tabB.getByTestId('seconds')).toHaveText('60')
+
+    // A 通过 storage 事件也应跟进为暂停，而不是继续把 running 写回
+    await expect(tabA.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+
+    // A 始终开着的情况下等待（其定时器若陈旧写回，本测试旧实现会复现 bug）
+    await tabB.waitForTimeout(2_500)
+
+    // 刷新暂停标签 B：必须仍是暂停，剩余时间不流逝
+    await tabB.reload()
+    await expect(tabB.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+    await expect(tabB.getByTestId('current-stage')).toHaveText('显影')
+    await expect(tabB.getByTestId('seconds')).toHaveText('60')
+
+    await tabA.close()
+  })
 })
 
 test.describe('冲洗完成', () => {
@@ -168,6 +202,7 @@ test.describe('时钟回拨保护', () => {
     const now = Date.now()
     await seedAndReload(page, {
       version: 1,
+      rev: 1,
       recipe: { develop: 60, stop: 30, fix: 300 },
       timer: { status: 'running', stage: 'develop', deadline: now + 60_000 },
       // 最近墙钟在 2 分钟后，当前时间更早，构成回拨
@@ -192,6 +227,7 @@ test.describe('时钟回拨保护', () => {
     const now = Date.now()
     await seedAndReload(page, {
       version: 1,
+      rev: 1,
       recipe: { develop: 60, stop: 30, fix: 300 },
       timer: { status: 'running', stage: 'develop', deadline: now + 60_000 },
       lastWallClock: now + 120_000,
