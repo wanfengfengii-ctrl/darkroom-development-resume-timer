@@ -1,0 +1,25 @@
+services:
+  # 常驻服务：只有 Web。宿主端口由 WEB_PORT 覆盖，默认 8080。
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    image: darkroom-timer-web:latest
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  # 一次性验收服务：`docker compose --profile verify run --rm verify`
+  # 跑完即退出，不属于日常 `docker compose up` 的常驻服务。
+  verify:
+    profiles: ["verify"]
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    image: darkroom-timer-verify:latest
+    environment:
+      E2E_BASE_URL: http://web:80
+    depends_on:
+      web:
+        condition: service_started
+    restart: "no"

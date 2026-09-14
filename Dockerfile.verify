@@ -1,0 +1,19 @@
+# 一次性验收服务：跑 Playwright 验收（刷新续时、后台跨阶段、回拨锁定）。
+# 官方镜像已预装与 Playwright 版本匹配的 Chromium 及全部系统依赖。
+FROM mcr.microsoft.com/playwright:v1.63.0-noble
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+# 官方镜像已装好匹配版本的浏览器，无需 postinstall 再下载
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+RUN npm ci
+
+COPY tsconfig.json vite.config.ts playwright.config.ts index.html ./
+COPY src ./src
+COPY e2e ./e2e
+
+# 指向 compose 网络中的 web 服务；设置后配置不再启动本地 server
+ENV E2E_BASE_URL=http://web:80
+
+CMD ["npx", "playwright", "test"]

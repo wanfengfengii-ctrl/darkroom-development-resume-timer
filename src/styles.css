@@ -1,0 +1,347 @@
+:root {
+  --bg: #14110d;
+  --panel: #1e1a14;
+  --panel-2: #262019;
+  --text: #f3ead8;
+  --muted: #b3a892;
+  --amber: #e8a33d;
+  --amber-dim: #8a5d1f;
+  --red: #e05c4b;
+  --green: #7bbf7b;
+  --line: #3a3328;
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(1200px 600px at 50% -10%, #211c15 0%, var(--bg) 60%);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+.app {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+.app-header {
+  text-align: center;
+  margin-bottom: 20px;
+}
+
+.app-header h1 {
+  margin: 0 0 6px;
+  font-size: 28px;
+  letter-spacing: 2px;
+  color: var(--amber);
+}
+
+.subtitle {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.card h2 {
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 6px 0 16px;
+  line-height: 1.6;
+}
+
+.fields {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.field {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  grid-template-areas:
+    "label label label"
+    "input unit error";
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.field-label {
+  grid-area: label;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+}
+
+.stage-index {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--amber-dim);
+  color: var(--text);
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+}
+
+.field input {
+  grid-area: input;
+  width: 100%;
+  font-size: 22px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.field input:focus {
+  outline: 2px solid var(--amber);
+  outline-offset: 1px;
+}
+
+.field input[aria-invalid="true"] {
+  border-color: var(--red);
+  outline-color: var(--red);
+}
+
+.unit {
+  grid-area: unit;
+  color: var(--muted);
+}
+
+.error {
+  grid-area: error;
+  color: var(--red);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 17px;
+  padding: 12px 20px;
+  border-radius: 12px;
+  cursor: pointer;
+  min-width: 110px;
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn.primary {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: #20160a;
+  font-weight: 700;
+}
+
+.btn.primary:disabled {
+  background: #4a4337;
+  border-color: #4a4337;
+  color: #8d8575;
+  cursor: not-allowed;
+}
+
+.btn.danger {
+  color: var(--red);
+  border-color: var(--red);
+  background: transparent;
+}
+
+.btn.ghost {
+  min-width: auto;
+  padding: 12px 16px;
+}
+
+form .btn.primary {
+  width: 100%;
+}
+
+/* ---- 计时面板 ---- */
+
+.stepper {
+  list-style: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0;
+  margin: 0 0 22px;
+}
+
+.step {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  position: relative;
+}
+
+.step:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  top: 13px;
+  left: calc(50% + 20px);
+  right: calc(-50% + 20px);
+  height: 2px;
+  background: var(--line);
+}
+
+.step-mark {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  z-index: 1;
+}
+
+.step-done {
+  color: var(--green);
+}
+
+.step-done .step-mark {
+  background: var(--green);
+  border-color: var(--green);
+  color: #14200f;
+}
+
+.step-done:not(:last-child)::after {
+  background: var(--green);
+}
+
+.step-current {
+  color: var(--amber);
+  font-weight: 700;
+}
+
+.step-current .step-mark {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: #20160a;
+  box-shadow: 0 0 0 4px rgba(232, 163, 61, 0.18);
+}
+
+.current-stage {
+  text-align: center;
+  font-size: 18px;
+  margin: 0 0 10px;
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 10px;
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  vertical-align: middle;
+}
+
+.badge-running {
+  background: rgba(232, 163, 61, 0.16);
+  color: var(--amber);
+}
+
+.badge-paused {
+  background: rgba(224, 92, 75, 0.16);
+  color: var(--red);
+}
+
+.countdown {
+  text-align: center;
+  margin: 8px 0 0;
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 10px;
+}
+
+.countdown-seconds {
+  font-size: clamp(72px, 22vw, 120px);
+  font-weight: 800;
+  line-height: 1;
+  color: var(--amber);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-paused .countdown-seconds {
+  color: var(--red);
+}
+
+.countdown-unit {
+  font-size: 22px;
+  color: var(--muted);
+}
+
+.countdown-clock {
+  text-align: center;
+  color: var(--muted);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  margin: 6px 0 22px;
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.panel-locked h2,
+.panel-done h2 {
+  color: var(--red);
+}
+
+.panel-done h2 {
+  color: var(--green);
+}
+
+.panel-locked .btn,
+.panel-done .btn {
+  margin-top: 12px;
+  width: 100%;
+}
+
+.panel-done .stepper {
+  margin: 16px 0 8px;
+}
+
+@media (max-width: 420px) {
+  .card {
+    padding: 18px;
+  }
+  .error {
+    white-space: normal;
+  }
+}

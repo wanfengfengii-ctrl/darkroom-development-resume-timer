@@ -1,0 +1,221 @@
+/**
+ * 暗房冲洗续时台 —— 纯函数状态机
+ *
+ * 持久化的状态只有两类：
+ *  - running：当前阶段 + 该阶段绝对截止时间
+ *  - paused：当前阶段 + 当时剩余毫秒
+ * 另存「最近墙钟时间 lastWallClock」用于检测时钟回拨。
+ *
+ * 所有时间均为 Date.now() 形式的 Unix 毫秒时间戳，不依赖任何 tick 计时，
+ * 因此刷新页面或平板息屏后，已过去的阶段绝不会被重走。
+ */
+
+export const STAGE_IDS = ['develop', 'stop', 'fix'] as const
+export type StageId = (typeof STAGE_IDS)[number]
+
+export const STAGE_LABELS: Record<StageId, string> = {
+  develop: '显影',
+  stop: '停显',
+  fix: '定影',
+}
+
+export interface Recipe {
+  develop: number
+  stop: number
+  fix: number
+}
+
+export type RecipeInput = Record<StageId, string>
+
+/** 运行中：阶段由 deadline 驱动 */
+export interface RunningState {
+  status: 'running'
+  stage: StageId
+  deadline: number
+}
+
+/** 暂停中：保留当时剩余毫秒 */
+export interface PausedState {
+  status: 'paused'
+  stage: StageId
+  remainingMs: number
+}
+
+/** 全部三阶段走完 */
+export interface DoneState {
+  status: 'done'
+}
+
+/** 检测到墙钟回拨，锁定；只有重置可清除 */
+export interface LockedState {
+  status: 'locked'
+  /** 持久化中曾见到的最大墙钟时间 */
+  lastWallClock: number
+  /** 本次读到、却更早的墙钟时间 */
+  observedAt: number
+}
+
+export type TimerState = RunningState | PausedState | DoneState | LockedState
+
+/** 写入 localStorage 的完整结构 */
+export interface PersistedState {
+  version: 1
+  recipe: Recipe
+  timer: TimerState
+  /** 最近一次见到的墙钟时间（启动/暂停/恢复/每次 tick 都会刷新） */
+  lastWallClock: number
+}
+
+export const STORAGE_KEY = 'darkroom-timer:v1'
+
+/** 校验单个秒数输入：必须是 1..1800 的整数 */
+export function parseDurationSeconds(raw: string): number | null {
+  const t = raw.trim()
+  if (!/^-?\d+$/.test(t)) return null
+  const n = Number(t)
+  if (!Number.isSafeInteger(n)) return null
+  if (n < 1 || n > 1800) return null
+  return n
+}
+
+export function validateRecipe(input: RecipeInput): {
+  valid: boolean
+  errors: Record<StageId, string | null>
+  recipe: Recipe | null
+} {
+  const errors = { develop: null, stop: null, fix: null } as Record<StageId, string | null>
+  const values = {} as Recipe
+  let valid = true
+  for (const stage of STAGE_IDS) {
+    const n = parseDurationSeconds(input[stage])
+    if (n === null) {
+      errors[stage] = '请输入 1–1800 的整数秒'
+      valid = false
+    } else {
+      values[stage] = n
+    }
+  }
+  return { valid, errors, recipe: valid ? values : null }
+}
+
+export function initialInput(): RecipeInput {
+  return { develop: '60', stop: '30', fix: '300' }
+}
+
+/** 启动：从显影开始，记录绝对截止时间 */
+export function startTimer(recipe: Recipe, now: number): PersistedState {
+  return {
+    version: 1,
+    recipe,
+    timer: { status: 'running', stage: 'develop', deadline: now + recipe.develop * 1000 },
+    lastWallClock: now,
+  }
+}
+
+/**
+ * 恢复/推进状态机：根据当前墙钟与 deadline 的关系推进。
+ * 若已逾期，用「未消费的逾期时长」连续跨过后续阶段；全部耗尽则完成。
+ *
+ * 另负责时钟回拨检测：now < lastWallClock 时立即锁定。
+ */
+export function advance(state: PersistedState, now: number): PersistedState {
+  if (now < state.lastWallClock) {
+    return {
+      ...state,
+      timer: { status: 'locked', lastWallClock: state.lastWallClock, observedAt: now },
+    }
+  }
+  if (state.timer.status !== 'running') {
+    return { ...state, lastWallClock: now }
+  }
+
+  let { stage, deadline } = state.timer
+  // 未到点：原样返回
+  if (deadline > now) {
+    return { ...state, lastWallClock: now }
+  }
+
+  // 连续跨过已到期的阶段，把逾期时长带到下一阶段
+  let i = STAGE_IDS.indexOf(stage)
+  while (deadline <= now) {
+    i += 1
+    if (i >= STAGE_IDS.length) {
+      return { ...state, timer: { status: 'done' }, lastWallClock: now }
+    }
+    const next = STAGE_IDS[i]
+    deadline += state.recipe[next] * 1000
+    stage = next
+  }
+  return {
+    ...state,
+    timer: { status: 'running', stage, deadline },
+    lastWallClock: now,
+  }
+}
+
+/** 暂停：保存当前剩余毫秒（刷新后仍为暂停） */
+export function pauseTimer(state: PersistedState, now: number): PersistedState {
+  const advanced = advance(state, now)
+  if (advanced.timer.status !== 'running') return advanced
+  const remainingMs = Math.max(0, advanced.timer.deadline - now)
+  return {
+    ...advanced,
+    timer: { status: 'paused', stage: advanced.timer.stage, remainingMs },
+    lastWallClock: now,
+  }
+}
+
+/** 继续：按当前墙钟重建截止时间 */
+export function resumeTimer(state: PersistedState, now: number): PersistedState {
+  if (state.timer.status !== 'paused') {
+    return advance(state, now)
+  }
+  // 先用持久化的最近墙钟检测回拨（锁定优先于一切）
+  const checked = advance(state, now)
+  if (checked.timer.status === 'locked') return checked
+  // 暂停期间不消耗时间；恢复时以剩余毫秒重建 deadline
+  const running: RunningState = {
+    status: 'running',
+    stage: state.timer.stage,
+    deadline: now + state.timer.remainingMs,
+  }
+  return advance({ ...checked, timer: running }, now)
+}
+
+/** 剩余整秒数（向上取整）；非运行态返回 null */
+export function remainingSecondsAt(timer: TimerState, now: number): number | null {
+  if (timer.status !== 'running') return null
+  return Math.max(0, Math.ceil((timer.deadline - now) / 1000))
+}
+
+/** 暂停态剩余整秒（向上取整） */
+export function pausedRemainingSeconds(timer: PausedState): number {
+  return Math.max(0, Math.ceil(timer.remainingMs / 1000))
+}
+
+// ---- localStorage 序列化 ----
+
+export function loadState(): PersistedState | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as PersistedState
+    if (parsed.version !== 1) return null
+    if (!parsed.timer || typeof parsed.lastWallClock !== 'number') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+export function saveState(state: PersistedState | null): void {
+  try {
+    if (state === null) {
+      localStorage.removeItem(STORAGE_KEY)
+    } else {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+    }
+  } catch {
+    // 隐私模式等情况下静默失败；计时功能本身不依赖存储写入成功
+  }
+}
