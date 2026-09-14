@@ -29,6 +29,10 @@ async function setTemperature(page: Page, temp: string): Promise<void> {
   await page.getByTestId('temperature-input').fill(temp)
 }
 
+async function setAgitation(page: Page, seconds: string): Promise<void> {
+  await page.getByTestId('agitation-input').fill(seconds)
+}
+
 async function readSeconds(page: Page): Promise<number> {
   return Number((await page.getByTestId('seconds').textContent())!.trim())
 }
@@ -475,6 +479,221 @@ test.describe('冲洗完成', () => {
     await expect(page.getByTestId('done-title')).toBeVisible({ timeout: 10_000 })
     await page.reload()
     await expect(page.getByTestId('done-title')).toBeVisible()
+  })
+})
+
+test.describe('显影搅动提醒', () => {
+  test('启用间隔后显影阶段提示「请搅动」，确认后按墙钟排下一次；进入停显后入口消失', async ({ page }) => {
+    await page.goto('/')
+    // 显影 12s：首次搅动 10s 到期，确认后约 2s 即跨入停显
+    await fillRecipe(page, '12', '3', '3')
+    await setAgitation(page, '10')
+    await page.getByTestId('start-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+
+    const prompt = page.getByTestId('agitation-prompt')
+    await expect(prompt).toHaveAttribute('data-due', 'false')
+    await expect(prompt).toContainText('距下次搅动还有')
+
+    // 持久化中写入了间隔与下一次提示绝对时刻
+    const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.agitation.intervalSeconds).toBe(10)
+    expect(typeof stored.agitation.nextAt).toBe('number')
+    expect(stored.agitation.status).toBe('running')
+
+    // 10 秒后到期：突出显示「请搅动」并出现确认按钮
+    await expect(prompt).toHaveAttribute('data-due', 'true', { timeout: 20_000 })
+    await expect(prompt).toContainText('请搅动')
+    const confirm = page.getByTestId('agitation-confirm')
+    await expect(confirm).toBeVisible()
+
+    // 到期后不会自行消失（未确认前一直待确认）
+    await page.waitForTimeout(1_200)
+    await expect(prompt).toHaveAttribute('data-due', 'true')
+
+    // 确认：回到倒计时，下一次约 10 秒
+    await confirm.click()
+    await expect(prompt).toHaveAttribute('data-due', 'false')
+    await expect(page.getByTestId('agitation-remaining')).toHaveText('10')
+
+    // 跨入停显：搅动入口整体消失，停显/定影都不再提醒
+    await expect(page.getByTestId('current-stage')).toHaveText('停显', { timeout: 8_000 })
+    await expect(prompt).toHaveCount(0)
+    await expect(page.getByTestId('agitation-confirm')).toHaveCount(0)
+    await expect(page.getByTestId('current-stage')).toHaveText('定影', { timeout: 8_000 })
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+  })
+
+  test('待提示期间刷新：节奏保持，刷新后仍能到期并确认', async ({ page }) => {
+    await page.goto('/')
+    await fillRecipe(page, '60', '30', '60')
+    await setAgitation(page, '10')
+    await page.getByTestId('start-button').click()
+
+    const prompt = page.getByTestId('agitation-prompt')
+    await expect(prompt).toHaveAttribute('data-due', 'false')
+
+    // 等待约 5 秒后刷新：仍在显影，搅动入口与倒计时都在
+    await page.waitForTimeout(5_000)
+    await page.reload()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    await expect(prompt).toHaveAttribute('data-due', 'false')
+    const remainingAfterReload = Number(
+      (await page.getByTestId('agitation-remaining').textContent())!.trim(),
+    )
+    expect(remainingAfterReload).toBeGreaterThan(0)
+    expect(remainingAfterReload).toBeLessThanOrEqual(6)
+
+    // 刷新后到期时刻不变，仍会到期
+    await expect(prompt).toHaveAttribute('data-due', 'true', { timeout: 15_000 })
+    await expect(page.getByTestId('agitation-confirm')).toBeVisible()
+    await page.getByTestId('agitation-confirm').click()
+    await expect(prompt).toHaveAttribute('data-due', 'false')
+    await expect(page.getByTestId('agitation-remaining')).toHaveText('10')
+  })
+
+  test('暂停冻结搅动剩余，继续后保持同一节奏', async ({ page }) => {
+    await page.goto('/')
+    await fillRecipe(page, '60', '30', '60')
+    await setAgitation(page, '10')
+    await page.getByTestId('start-button').click()
+
+    await page.waitForTimeout(3_000)
+    await page.getByTestId('pause-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+
+    const prompt = page.getByTestId('agitation-prompt')
+    await expect(prompt).toContainText('暂停中')
+    const frozen = Number((await page.getByTestId('agitation-remaining').textContent())!.trim())
+    expect(frozen).toBeGreaterThan(5)
+    expect(frozen).toBeLessThanOrEqual(7)
+
+    // 暂停期间剩余不流逝
+    await page.waitForTimeout(2_000)
+    await expect(page.getByTestId('agitation-remaining')).toHaveText(String(frozen))
+
+    // 继续：剩余从冻结值继续倒数
+    await page.getByTestId('resume-button').click()
+    await expect(prompt).toHaveAttribute('data-due', 'false')
+    await expect(page.getByTestId('agitation-remaining')).toHaveText(String(frozen))
+    await expect(prompt).toHaveAttribute('data-due', 'true', { timeout: 12_000 })
+  })
+
+  test('息屏漏过多个周期：恢复后只有一条待确认提示，确认后排下一次', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 600, stop: 30, fix: 300 },
+      // 间隔 30s，下一次提示在 125 秒前（理论上错过 4 个周期）
+      agitation: { status: 'running', intervalSeconds: 30, nextAt: now - 125_000 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 600_000 },
+      lastWallClock: now - 125_000,
+    })
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    const prompts = page.getByTestId('agitation-prompt')
+    await expect(prompts).toHaveCount(1)
+    await expect(prompts).toHaveAttribute('data-due', 'true')
+    await expect(prompts).toContainText('请搅动')
+
+    await page.getByTestId('agitation-confirm').click()
+    await expect(prompts).toHaveAttribute('data-due', 'false')
+    await expect(page.getByTestId('agitation-remaining')).toHaveText('30')
+
+    const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.agitation.nextAt).toBeGreaterThan(now)
+  })
+
+  test('留空启动：显影/暂停/停显/定影/完成全程不出现搅动入口', async ({ page }) => {
+    await page.goto('/')
+    await startRecipe(page, '4', '2', '2')
+
+    // 运行中的显影阶段也没有任何搅动入口
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+    await expect(page.getByTestId('agitation-confirm')).toHaveCount(0)
+
+    // 暂停态同样没有
+    await page.getByTestId('pause-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+    await page.getByTestId('resume-button').click()
+
+    // 一路到完成，入口始终不出现
+    await expect(page.getByTestId('done-title')).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+    await expect(page.getByTestId('agitation-confirm')).toHaveCount(0)
+
+    // 持久化记录中也没有 agitation 字段
+    const raw = await page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY)
+    expect(raw).not.toBeNull()
+    expect('agitation' in JSON.parse(raw!)).toBe(false)
+  })
+
+  test('间隔格式错误或越界时在配方旁说明并阻止启动', async ({ page }) => {
+    await page.goto('/')
+    await fillRecipe(page, '60', '30', '300')
+    const start = page.getByTestId('start-button')
+    const error = page.getByTestId('agitation-error')
+
+    for (const bad of ['9', '301', '12.5', 'abc', '-10', '30秒']) {
+      await setAgitation(page, bad)
+      await expect(start).toBeDisabled()
+      await expect(error).toBeVisible()
+    }
+
+    // 边界值合法；清空后也可直接启动
+    await setAgitation(page, '10')
+    await expect(start).toBeEnabled()
+    await expect(error).toHaveCount(0)
+    await setAgitation(page, '300')
+    await expect(start).toBeEnabled()
+    await setAgitation(page, '')
+    await expect(start).toBeEnabled()
+  })
+
+  test('无搅动字段的旧会话记录按未启用读取，面板无搅动入口，倒计时/跨阶段正常', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 3, stop: 2, fix: 2 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 3_000 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+    await expect(page.getByTestId('current-stage')).toHaveText('停显', { timeout: 8_000 })
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+  })
+
+  test('一个标签确认搅动后，另一个标签的待确认提示同步消失', async ({ context }) => {
+    // 标签 A：显影中、搅动间隔 10s
+    const tabA = await context.newPage()
+    await tabA.goto('/')
+    await fillRecipe(tabA, '120', '30', '60')
+    await setAgitation(tabA, '10')
+    await tabA.getByTestId('start-button').click()
+
+    // 标签 B 打开同一会话
+    const tabB = await context.newPage()
+    await tabB.goto('/')
+    await expect(tabB.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(tabB.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'false')
+
+    // 到期后两个标签都提示
+    await expect(tabA.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'true', { timeout: 20_000 })
+    await expect(tabB.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'true')
+
+    // 在 A 确认：B 经 storage 事件采纳高 rev 记录，提示消失且不复活
+    await tabA.getByTestId('agitation-confirm').click()
+    await expect(tabA.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'false')
+    await expect(tabB.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'false')
+    await tabB.waitForTimeout(1_500)
+    await expect(tabB.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'false')
+
+    await tabA.close()
+    await tabB.close()
   })
 })
 

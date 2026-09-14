@@ -51,6 +51,23 @@ export interface TemperatureInfo {
   baseDevelop: number
 }
 
+// ---- 显影搅动提醒 ----
+
+/** 允许的搅动间隔范围（秒） */
+export const AGITATION_MIN = 10
+export const AGITATION_MAX = 300
+
+/**
+ * 搅动节奏，只在显影阶段生效；随暂停/继续在「绝对时刻」与「冻结剩余」间转换：
+ *  - running：下一次提示的绝对墙钟时刻 nextAt，now >= nextAt 即待确认，
+ *    漏过多少个周期都只是同一条待确认提示，确认后按确认时刻重排
+ *  - paused：暂停瞬间冻结的距下次提示剩余毫秒，暂停期间不流逝
+ * 跨入停显/定影、完成或回拨锁定时该字段整体清除。
+ */
+export type AgitationState =
+  | { status: 'running'; intervalSeconds: number; nextAt: number }
+  | { status: 'paused'; intervalSeconds: number; remainingMs: number }
+
 /** 运行中：阶段由 deadline 驱动 */
 export interface RunningState {
   status: 'running'
@@ -96,6 +113,11 @@ export interface PersistedState {
    * recipe 就是未修正的原配方。停显/定影不参与换算。
    */
   temperature?: TemperatureInfo
+  /**
+   * 显影搅动节奏。仅当启动时填写了搅动间隔才存在；缺省（含旧本地记录）意味着
+   * 未启用搅动提醒。停显/定影、完成与锁定态均无此字段。
+   */
+  agitation?: AgitationState
   timer: TimerState
   /** 最近一次见到的墙钟时间（启动/暂停/恢复/每次 tick 都会刷新） */
   lastWallClock: number
@@ -131,6 +153,20 @@ export function parseDurationSeconds(raw: string): number | null {
 }
 
 /**
+ * 校验可选搅动间隔：留空（null，表示不启用）合法；否则须为 10–300 的整数秒。
+ */
+export function parseAgitationInterval(raw: string): { ok: true; value: number | null } | { ok: false; error: string } {
+  const t = raw.trim()
+  if (t === '') return { ok: true, value: null }
+  if (!/^-?\d+$/.test(t)) return { ok: false, error: '搅动间隔需为 10–300 的整数秒' }
+  const n = Number(t)
+  if (!Number.isSafeInteger(n) || n < AGITATION_MIN || n > AGITATION_MAX) {
+    return { ok: false, error: '搅动间隔需在 10–300 秒之间' }
+  }
+  return { ok: true, value: n }
+}
+
+/**
  * 液温偏离 20℃ 时的显影秒数换算：
  *   修正秒数 = 基准秒数 × 2^((20 − 液温) / 6)
  * 结果四舍五入到整数秒。调用前必须已通过 parseTemperature 校验。
@@ -160,6 +196,7 @@ export interface ValidatedRecipe {
   valid: boolean
   errors: Record<StageId, string | null>
   temperatureError: string | null
+  agitationError: string | null
   recipe: Recipe | null
   /** 留空或 20℃ 时为 null，表示未做温度修正 */
   temperature: number | null
@@ -167,9 +204,15 @@ export interface ValidatedRecipe {
   baseDevelop: number | null
   /** 修正后的显影秒数；未填温度时为 null（界面直接展示基准三段秒数） */
   adjustedDevelop: number | null
+  /** 搅动间隔（秒）；留空时为 null，表示不启用搅动提醒 */
+  agitationInterval: number | null
 }
 
-export function validateRecipe(input: RecipeInput, tempRaw = ''): ValidatedRecipe {
+export function validateRecipe(
+  input: RecipeInput,
+  tempRaw = '',
+  agitationRaw = '',
+): ValidatedRecipe {
   const errors = { develop: null, stop: null, fix: null } as Record<StageId, string | null>
   const values = {} as Recipe
   let valid = true
@@ -207,6 +250,16 @@ export function validateRecipe(input: RecipeInput, tempRaw = ''): ValidatedRecip
     }
   }
 
+  let agitationError: string | null = null
+  let agitationInterval: number | null = null
+  const agitation = parseAgitationInterval(agitationRaw)
+  if (!agitation.ok) {
+    agitationError = agitation.error
+    valid = false
+  } else {
+    agitationInterval = agitation.value
+  }
+
   if (valid) {
     if (temperature !== null) {
       // 现用配方：仅显影被替换为修正值，停显/定影保持原值
@@ -218,10 +271,12 @@ export function validateRecipe(input: RecipeInput, tempRaw = ''): ValidatedRecip
     valid,
     errors,
     temperatureError,
+    agitationError,
     recipe: valid ? values : null,
     temperature,
     baseDevelop,
     adjustedDevelop,
+    agitationInterval,
   }
 }
 
@@ -234,22 +289,32 @@ export function initialTemperature(): string {
   return ''
 }
 
+/** 新会话默认不填搅动间隔（留空即不启用搅动提醒） */
+export function initialAgitation(): string {
+  return ''
+}
+
 /**
  * 启动：从显影开始，记录绝对截止时间；rev 在调用方基于当前存储递增。
  * 传入的 recipe 必须是「现用配方」（液温修正后仅 develop 被替换）；
- * temperature 为修正来源（液温 + 基准显影秒），未修正时省略。
+ * temperature 为修正来源（液温 + 基准显影秒），未修正时省略；
+ * agitationInterval 为搅动间隔秒数，留空（undefined/null）时不启用搅动提醒。
  */
 export function startTimer(
   recipe: Recipe,
   now: number,
   rev: number,
   temperature?: TemperatureInfo,
+  agitationInterval?: number | null,
 ): PersistedState {
   return {
     version: 1,
     rev,
     recipe,
     ...(temperature ? { temperature } : {}),
+    ...(agitationInterval != null
+      ? { agitation: { status: 'running', intervalSeconds: agitationInterval, nextAt: now + agitationInterval * 1000 } }
+      : {}),
     timer: { status: 'running', stage: 'develop', deadline: now + recipe.develop * 1000 },
     lastWallClock: now,
   }
@@ -270,11 +335,15 @@ export function resetTombstone(rev: number): ResetTombstone {
  * 若已逾期，用「未消费的逾期时长」连续跨过后续阶段；全部耗尽则完成。
  *
  * 另负责时钟回拨检测：now < lastWallClock 时立即锁定。
+ *
+ * 搅动提醒只属于显影：跨入停显/定影、完成或锁定时整体清除 agitation；
+ * 仍在显影运行时保留（是否到期由 nextAt 与墙钟比较得出，漏过的周期自然合并）。
  */
 export function advance(state: PersistedState, now: number): PersistedState {
   if (now < state.lastWallClock) {
     return {
       ...state,
+      agitation: undefined,
       timer: { status: 'locked', lastWallClock: state.lastWallClock, observedAt: now },
     }
   }
@@ -293,7 +362,7 @@ export function advance(state: PersistedState, now: number): PersistedState {
   while (deadline <= now) {
     i += 1
     if (i >= STAGE_IDS.length) {
-      return { ...state, timer: { status: 'done' }, lastWallClock: now }
+      return { ...state, agitation: undefined, timer: { status: 'done' }, lastWallClock: now }
     }
     const next = STAGE_IDS[i]
     deadline += state.recipe[next] * 1000
@@ -301,6 +370,8 @@ export function advance(state: PersistedState, now: number): PersistedState {
   }
   return {
     ...state,
+    // 离开显影（跨入停显）后不再产生搅动提醒
+    ...(stage === 'develop' ? {} : { agitation: undefined }),
     timer: { status: 'running', stage, deadline },
     lastWallClock: now,
   }
@@ -313,6 +384,16 @@ export function pauseTimer(state: PersistedState, now: number): PersistedState {
   const remainingMs = Math.max(0, advanced.timer.deadline - now)
   return {
     ...advanced,
+    // 冻结距下次搅动提示的剩余毫秒；暂停期间不流逝
+    ...(advanced.agitation && advanced.agitation.status === 'running'
+      ? {
+          agitation: {
+            status: 'paused',
+            intervalSeconds: advanced.agitation.intervalSeconds,
+            remainingMs: Math.max(0, advanced.agitation.nextAt - now),
+          } satisfies AgitationState,
+        }
+      : {}),
     timer: { status: 'paused', stage: advanced.timer.stage, remainingMs },
     lastWallClock: now,
   }
@@ -332,7 +413,16 @@ export function resumeTimer(state: PersistedState, now: number): PersistedState 
     stage: state.timer.stage,
     deadline: now + state.timer.remainingMs,
   }
-  return advance({ ...checked, timer: running }, now)
+  // 搅动节奏同样以冻结的剩余毫秒重建绝对时刻（remainingMs 可能为 0：已待确认）
+  const agitation: AgitationState | undefined =
+    state.agitation && state.agitation.status === 'paused'
+      ? {
+          status: 'running',
+          intervalSeconds: state.agitation.intervalSeconds,
+          nextAt: now + state.agitation.remainingMs,
+        }
+      : undefined
+  return advance({ ...checked, ...(agitation ? { agitation } : {}), timer: running }, now)
 }
 
 /**
@@ -346,6 +436,7 @@ export function calibrateTimer(state: PersistedState, seconds: number, now: numb
   if (now < state.lastWallClock) {
     return {
       ...state,
+      agitation: undefined,
       timer: { status: 'locked', lastWallClock: state.lastWallClock, observedAt: now },
     }
   }
@@ -365,6 +456,50 @@ export function calibrateTimer(state: PersistedState, seconds: number, now: numb
     }
   }
   return state
+}
+
+/**
+ * 确认搅动：仅当显影运行中且提示已到期（now >= nextAt）时，按当前墙钟排定
+ * 下一次提示 nextAt = now + interval；其余情况原样返回（幂等）。
+ * 休眠漏过多个周期也只会有一条待确认提示，确认后节奏从确认时刻重新起算。
+ */
+export function acknowledgeAgitation(state: PersistedState, now: number): PersistedState {
+  const a = state.agitation
+  if (state.timer.status !== 'running' || state.timer.stage !== 'develop') return state
+  if (!a || a.status !== 'running' || a.nextAt > now) return state
+  return {
+    ...state,
+    agitation: { status: 'running', intervalSeconds: a.intervalSeconds, nextAt: now + a.intervalSeconds * 1000 },
+    lastWallClock: now,
+  }
+}
+
+/** 计时面板消费的搅动提示视图：无搅动字段（含旧记录）时为 null */
+export interface AgitationView {
+  /** 提示已到期待确认（漏过多少周期都合并为同一条） */
+  due: boolean
+  /** 距下次提示的整秒（向上取整）；待确认时为 0；暂停时为冻结剩余 */
+  remainingSeconds: number
+  /** 本轮搅动间隔（秒） */
+  intervalSeconds: number
+}
+
+export function agitationView(state: PersistedState, now: number): AgitationView | null {
+  const a = state.agitation
+  if (!a) return null
+  if (a.status === 'paused') {
+    return {
+      due: false,
+      remainingSeconds: Math.max(0, Math.ceil(a.remainingMs / 1000)),
+      intervalSeconds: a.intervalSeconds,
+    }
+  }
+  const due = a.nextAt <= now
+  return {
+    due,
+    remainingSeconds: due ? 0 : Math.max(0, Math.ceil((a.nextAt - now) / 1000)),
+    intervalSeconds: a.intervalSeconds,
+  }
 }
 
 /** 剩余整秒数（向上取整）；非运行态返回 null */
@@ -445,6 +580,31 @@ function reviveTemperature(v: unknown): TemperatureInfo | null {
   return { temperature, baseDevelop }
 }
 
+/**
+ * 恢复搅动节奏：字段整体缺省（旧本地记录）合法地解释为「未启用」。
+ * 一旦出现 agitation 字段，其形状必须完整合法，且与 timer 的状态/阶段一致
+ * （搅动只在显影存在），否则整条记录拒绝。
+ */
+function reviveAgitation(v: unknown, timer: TimerState): AgitationState | null {
+  if (v === undefined || v === null) return null // 无字段：未启用
+  if (typeof v !== 'object') return null
+  const a = v as Record<string, unknown>
+  if (!isFiniteInteger(a.intervalSeconds) || a.intervalSeconds < AGITATION_MIN || a.intervalSeconds > AGITATION_MAX) {
+    return null
+  }
+  // 锁定/完成态不应再带搅动字段；停显/定影阶段也不应存在
+  if (timer.status === 'done' || timer.status === 'locked' || timer.stage !== 'develop') return null
+  if (a.status === 'running') {
+    if (timer.status !== 'running' || !isFiniteInteger(a.nextAt)) return null
+    return { status: 'running', intervalSeconds: a.intervalSeconds, nextAt: a.nextAt }
+  }
+  if (a.status === 'paused') {
+    if (timer.status !== 'paused' || !isFiniteInteger(a.remainingMs) || a.remainingMs < 0) return null
+    return { status: 'paused', intervalSeconds: a.intervalSeconds, remainingMs: a.remainingMs }
+  }
+  return null
+}
+
 function revive(raw: string): StoredRecord | null {
   let parsed: unknown
   try {
@@ -463,17 +623,26 @@ function revive(raw: string): StoredRecord | null {
   const timer = reviveTimer(r.timer)
   if (!recipe || !timer || !isFiniteInteger(r.lastWallClock)) return null
 
-  // temperature 缺省 = 未修正旧记录；存在但非法 = 损坏，整体拒绝
-  if (!('temperature' in r)) {
-    return { version: 1, rev: r.rev, recipe, timer, lastWallClock: r.lastWallClock }
+  // temperature / agitation 缺省 = 未修正/未启用（含旧本地记录）；
+  // 一旦字段存在但形状非法或与 timer 状态不一致 = 损坏，整体拒绝
+  let temperature: TemperatureInfo | null = null
+  if ('temperature' in r) {
+    temperature = reviveTemperature(r.temperature)
+    if (!temperature) return null
   }
-  const temperature = reviveTemperature(r.temperature)
-  if (!temperature) return null
+
+  let agitation: AgitationState | null = null
+  if ('agitation' in r) {
+    agitation = reviveAgitation(r.agitation, timer)
+    if (!agitation) return null
+  }
+
   return {
     version: 1,
     rev: r.rev,
     recipe,
-    temperature,
+    ...(temperature ? { temperature } : {}),
+    ...(agitation ? { agitation } : {}),
     timer,
     lastWallClock: r.lastWallClock,
   }

@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import {
   STAGE_IDS,
   STAGE_LABELS,
+  agitationView,
   parseDurationSeconds,
   pausedRemainingSeconds,
   remainingSecondsAt,
@@ -14,6 +15,7 @@ interface Props {
   onPause: () => void
   onResume: () => void
   onCalibrate: (seconds: number) => void
+  onAcknowledge: () => void
   onReset: () => void
 }
 
@@ -21,6 +23,46 @@ function formatClock(totalSeconds: number): string {
   const m = Math.floor(totalSeconds / 60)
   const s = totalSeconds % 60
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
+
+/**
+ * 显影搅动提示（字段不存在时——含启动留空与旧记录——整体不渲染）：
+ *  - 运行中未到期：显示距下次提示的秒数
+ *  - 运行中已到期：突出显示「请搅动」并提供确认；漏过多个周期也只此一条
+ *  - 暂停中：显示冻结的剩余秒数，暂停期间不流逝
+ * 进入停显/定影后 state.agitation 已被状态机清除，这里自然消失。
+ */
+function AgitationPrompt({
+  state,
+  now,
+  onConfirm,
+}: {
+  state: PersistedState
+  now: number
+  onConfirm: () => void
+}) {
+  const view = agitationView(state, now)
+  if (!view) return null
+  const paused = state.timer.status === 'paused'
+
+  if (view.due) {
+    return (
+      <div className="agitation agitation-due" data-testid="agitation-prompt" data-due="true" role="alert">
+        <span className="agitation-text">🌀 请搅动显影罐</span>
+        <button type="button" className="btn primary" onClick={onConfirm} data-testid="agitation-confirm">
+          已搅动
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <p className="agitation agitation-wait" data-testid="agitation-prompt" data-due="false">
+      {paused ? '暂停中：搅动提示已冻结，剩余 ' : `距下次搅动还有 `}
+      <strong data-testid="agitation-remaining">{view.remainingSeconds}</strong> 秒
+      <span className="agitation-meta">（每 {view.intervalSeconds} 秒，仅显影阶段）</span>
+    </p>
+  )
 }
 
 /** 三阶段进度提示：已完成阶段打勾，唯一当前阶段高亮，未到阶段置灰 */
@@ -64,7 +106,7 @@ function TemperatureSource({ state }: { state: PersistedState }) {
   )
 }
 
-export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onReset }: Props) {
+export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onAcknowledge, onReset }: Props) {
   const timer = state.timer
   const [calibrateInput, setCalibrateInput] = useState('')
   const [calibrateError, setCalibrateError] = useState<string | null>(null)
@@ -145,6 +187,8 @@ export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onReset
         <span className="countdown-unit">秒</span>
       </div>
       <p className="countdown-clock">剩余 {formatClock(seconds)}</p>
+
+      <AgitationPrompt state={state} now={now} onConfirm={onAcknowledge} />
 
       <div className="actions">
         {timer.status === 'running' ? (

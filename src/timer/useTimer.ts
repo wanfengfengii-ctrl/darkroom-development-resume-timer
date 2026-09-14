@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  acknowledgeAgitation,
   advance,
   calibrateTimer,
   commitRecord,
@@ -21,19 +22,20 @@ import {
  * 计时器状态机的 React 绑定，支持同一冲洗在多个标签页同时打开：
  *  - 挂载时从 localStorage 恢复并立即按墙钟推进（跨阶段/完成/回拨锁定）
  *  - 运行中每 200ms 按墙钟推进并以相同 rev 提交；暂停/完成/锁定不产生后台写入
- *  - 显式操作（开始/暂停/继续/校准/重置）把 rev +1 后提交（commit）
- *  - 监听 storage 事件：其它标签页暂停/继续/校准/重置后本页立即跟进
- *  - 提交带 rev 比较：低 rev 的陈旧 running tick 无法覆盖高 rev 的暂停/校准记录；
+ *  - 显式操作（开始/暂停/继续/校准/确认搅动/重置）把 rev +1 后提交（commit）
+ *  - 监听 storage 事件：其它标签页暂停/继续/校准/确认搅动/重置后本页立即跟进
+ *  - 提交带 rev 比较：低 rev 的陈旧 running tick 无法覆盖高 rev 的暂停/校准/确认记录；
  *    重置写高 rev 墓碑，旧标签页不能把会话复活
  *  - 页面重新可见时重新从存储读取并补推进（息屏唤醒、后台标签切回）
  */
 export function useTimer(): {
   state: PersistedState | null
   now: number
-  start: (recipe: Recipe, temperature?: TemperatureInfo) => void
+  start: (recipe: Recipe, temperature?: TemperatureInfo, agitationInterval?: number | null) => void
   pause: () => void
   resume: () => void
   calibrate: (seconds: number) => void
+  acknowledge: () => void
   reset: () => void
 } {
   const recordRef = useRef<StoredRecord | null>(null)
@@ -117,12 +119,12 @@ export function useTimer(): {
   }, [adopt, syncFromStorage])
 
   const start = useCallback(
-    (recipe: Recipe, temperature?: TemperatureInfo) => {
+    (recipe: Recipe, temperature?: TemperatureInfo, agitationInterval?: number | null) => {
       const t = Date.now()
       setNow(t)
       const base = loadRecord() ?? recordRef.current
       const rev = (base ? base.rev : 0) + 1
-      adopt(commitRecord(startTimer(recipe, t, rev, temperature)))
+      adopt(commitRecord(startTimer(recipe, t, rev, temperature, agitationInterval ?? null)))
     },
     [adopt],
   )
@@ -149,6 +151,26 @@ export function useTimer(): {
     [bump],
   )
 
+  /**
+   * 确认搅动：显式操作，rev +1 提交，其它标签页经 storage 事件消失提示。
+   * 若提示已被其它标签页确认（存储已是更高 rev 的未到期记录），这里幂等为空操作；
+   * commitRecord 若返回更高 rev 的现存记录（确认竞态），同样直接采纳它。
+   */
+  const acknowledge = useCallback(() => {
+    const t = Date.now()
+    setNow(t)
+    const base = loadRecord() ?? recordRef.current
+    if (!base || !isPersistedState(base)) return
+    const next = acknowledgeAgitation(base, t)
+    if (next === base) {
+      // 已被其它标签处理或本就未到期：采纳存储中更高 rev 的记录即可
+      if (base !== recordRef.current) adopt(base)
+      return
+    }
+    const candidate = next.rev === base.rev ? withRev(next, base.rev + 1) : next
+    adopt(commitRecord(candidate))
+  }, [adopt])
+
   const reset = useCallback(() => {
     const base = loadRecord() ?? recordRef.current
     const rev = (base ? base.rev : 0) + 1
@@ -157,5 +179,5 @@ export function useTimer(): {
   }, [adopt])
 
   const state = record && isPersistedState(record) ? record : null
-  return { state, now, start, pause, resume, calibrate, reset }
+  return { state, now, start, pause, resume, calibrate, acknowledge, reset }
 }

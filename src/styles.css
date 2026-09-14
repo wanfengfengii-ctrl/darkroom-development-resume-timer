@@ -249,6 +249,19 @@ body {
   margin: 8px 0 0;
 }
 
+/* ---- 可选搅动间隔 ---- */
+
+.field-agitation {
+  margin-bottom: 22px;
+  padding-top: 4px;
+}
+
+.field-agitation .field-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 15px;
+}
+
 /* 计时面板：本轮温度修正来源 */
 .temp-source {
   text-align: center;
@@ -408,6 +421,63 @@ form .btn.primary {
   display: flex;
   gap: 12px;
   justify-content: center;
+}
+
+/* ---- 显影搅动提示 ---- */
+
+.agitation {
+  margin: 0 0 18px;
+}
+
+.agitation-wait {
+  text-align: center;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.agitation-wait strong {
+  color: var(--amber);
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+}
+
+.agitation-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.agitation-due {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-radius: 12px;
+  background: rgba(224, 92, 75, 0.16);
+  border: 2px solid var(--red);
+  animation: agitation-pulse 1s ease-in-out infinite alternate;
+}
+
+.agitation-due .agitation-text {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--red);
+  letter-spacing: 1px;
+}
+
+.agitation-due .btn {
+  min-width: auto;
+  padding: 10px 18px;
+  flex-shrink: 0;
+}
+
+@keyframes agitation-pulse {
+  from {
+    box-shadow: 0 0 0 0 rgba(224, 92, 75, 0.45);
+  }
+  to {
+    box-shadow: 0 0 0 8px rgba(224, 92, 75, 0);
+  }
 }
 
 /* ---- 校准剩余时间 ---- */

@@ -1,13 +1,18 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  AGITATION_MAX,
+  AGITATION_MIN,
   STAGE_IDS,
   STORAGE_KEY,
+  acknowledgeAgitation,
   adjustDevelopSeconds,
   advance,
+  agitationView,
   calibrateTimer,
   commitRecord,
   isPersistedState,
   loadRecord,
+  parseAgitationInterval,
   parseTemperature,
   pauseTimer,
   pausedRemainingSeconds,
@@ -519,6 +524,18 @@ describe('校准剩余时间', () => {
       expect(result.timer.observedAt).toBe(T0 + 50 * SECOND)
     }
   })
+
+  it('带搅动的会话时钟回拨时（含校准路径）锁定并清除搅动字段', () => {
+    const s = startTimer(recipe, T0, 1, undefined, 30)
+    s.lastWallClock = T0 + 100 * SECOND
+    const viaAdvance = advance(s, T0 + 50 * SECOND)
+    expect(viaAdvance.timer.status).toBe('locked')
+    expect(viaAdvance.agitation).toBeUndefined()
+
+    const viaCalibrate = calibrateTimer(s, 60, T0 + 50 * SECOND)
+    expect(viaCalibrate.timer.status).toBe('locked')
+    expect(viaCalibrate.agitation).toBeUndefined()
+  })
 })
 
 describe('时钟回拨保护', () => {
@@ -728,5 +745,412 @@ describe('多标签页 rev 仲裁（跨标签暂停保持）', () => {
     const fresh = startTimer(recipe, T0 + 1000, 3)
     expect(commitRecord(fresh)).toEqual(fresh)
     expect(loadRecord()).toEqual(fresh)
+  })
+})
+
+describe('搅动间隔 parseAgitationInterval', () => {
+  it('留空解析为 null（不启用）', () => {
+    expect(parseAgitationInterval('')).toEqual({ ok: true, value: null })
+    expect(parseAgitationInterval('   ')).toEqual({ ok: true, value: null })
+  })
+
+  it.each([
+    ['10', AGITATION_MIN],
+    ['300', AGITATION_MAX],
+    [' 30 ', 30],
+    ['060', 60],
+  ])('接受合法整数秒 %s', (raw, value) => {
+    expect(parseAgitationInterval(raw)).toEqual({ ok: true, value })
+  })
+
+  it.each([
+    ['9', '低于下界'],
+    ['0', '零'],
+    ['-30', '负数'],
+    ['301', '高于上界'],
+    ['10.5', '小数'],
+    ['abc', '非数字'],
+    ['30秒', '带单位'],
+    ['1e2', '科学计数'],
+  ])('拒绝非法间隔 %s（%s）', (raw, _name) => {
+    const r = parseAgitationInterval(raw)
+    expect(r.ok).toBe(false)
+  })
+})
+
+describe('validateRecipe — 搅动间隔', () => {
+  const baseInput: RecipeInput = { develop: '60', stop: '30', fix: '300' }
+
+  it('留空：合法且 agitationInterval 为 null，不阻止启动', () => {
+    const r = validateRecipe(baseInput, '', '')
+    expect(r.valid).toBe(true)
+    expect(r.agitationInterval).toBeNull()
+    expect(r.agitationError).toBeNull()
+  })
+
+  it('合法间隔随校验结果给出', () => {
+    const r = validateRecipe(baseInput, '', '30')
+    expect(r.valid).toBe(true)
+    expect(r.agitationInterval).toBe(30)
+  })
+
+  it('可与液温修正同时启用', () => {
+    const r = validateRecipe(baseInput, '18', '15')
+    expect(r.valid).toBe(true)
+    expect(r.recipe?.develop).toBe(76)
+    expect(r.agitationInterval).toBe(15)
+    expect(r.temperature).toBe(18)
+  })
+
+  it('越界（9 秒）时整体非法并在间隔字段说明，阻止启动', () => {
+    const r = validateRecipe(baseInput, '', '9')
+    expect(r.valid).toBe(false)
+    expect(r.recipe).toBeNull()
+    expect(r.agitationError).toContain('10–300')
+  })
+
+  it('格式错误（小数/非数字）时整体非法并说明', () => {
+    const r1 = validateRecipe(baseInput, '', '12.5')
+    expect(r1.valid).toBe(false)
+    expect(r1.agitationError).not.toBeNull()
+    const r2 = validateRecipe(baseInput, '', '快')
+    expect(r2.valid).toBe(false)
+    expect(r2.agitationError).not.toBeNull()
+  })
+
+  it('搅动间隔非法与液温非法可同时出现', () => {
+    const r = validateRecipe(baseInput, '99', '5')
+    expect(r.valid).toBe(false)
+    expect(r.temperatureError).not.toBeNull()
+    expect(r.agitationError).not.toBeNull()
+  })
+})
+
+describe('启动写入搅动节奏', () => {
+  it('带间隔启动：首次提示时刻 = 启动墙钟 + 间隔', () => {
+    const s = startTimer(recipe, T0, 1, undefined, 30)
+    expect(s.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: T0 + 30 * SECOND })
+  })
+
+  it('留空/未传间隔启动：不写 agitation 字段', () => {
+    expect(startTimer(recipe, T0, 1).agitation).toBeUndefined()
+    expect(startTimer(recipe, T0, 1, undefined, null).agitation).toBeUndefined()
+    expect('agitation' in startTimer(recipe, T0, 1, undefined, undefined)).toBe(false)
+  })
+
+  it('可与温度来源同时持久化', () => {
+    const s = startTimer({ develop: 76, stop: 30, fix: 300 }, T0, 1, { temperature: 18, baseDevelop: 60 }, 20)
+    expect(s.temperature).toEqual({ temperature: 18, baseDevelop: 60 })
+    expect(s.agitation).toEqual({ status: 'running', intervalSeconds: 20, nextAt: T0 + 20 * SECOND })
+  })
+})
+
+describe('搅动提示到期与确认（固定墙钟）', () => {
+  /** 启动一个显影 60s、搅动间隔 30s 的会话 */
+  const agitated = () => startTimer(recipe, T0, 1, undefined, 30)
+
+  it('显影中未到期：视图给出向上取整的剩余秒，且不突出', () => {
+    const s = advance(agitated(), T0 + 10 * SECOND)
+    const view = agitationView(s, T0 + 10 * SECOND)
+    expect(view).toEqual({ due: false, remainingSeconds: 20, intervalSeconds: 30 })
+  })
+
+  it('到点（nextAt）即待确认；确认前一直保持待确认', () => {
+    let s = agitated()
+    s = advance(s, T0 + 30 * SECOND)
+    expect(agitationView(s, T0 + 30 * SECOND)?.due).toBe(true)
+    // 不再有自动变化：没有确认前，过 10 秒仍是同一条待确认提示
+    s = advance(s, T0 + 40 * SECOND)
+    expect(agitationView(s, T0 + 40 * SECOND)).toEqual({ due: true, remainingSeconds: 0, intervalSeconds: 30 })
+  })
+
+  it('确认后按确认时刻墙钟排定下次（nextAt = 确认墙钟 + 间隔）', () => {
+    let s = advance(agitated(), T0 + 30 * SECOND)
+    s = acknowledgeAgitation(s, T0 + 30 * SECOND)
+    expect(s.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: T0 + 60 * SECOND })
+    expect(agitationView(s, T0 + 30 * SECOND)?.due).toBe(false)
+
+    // 稍晚确认（没有正好卡点）：节奏从确认时刻起算，而不是补齐漏掉的周期
+    s = advance(agitated(), T0 + 40 * SECOND)
+    s = acknowledgeAgitation(s, T0 + 40 * SECOND)
+    expect(s.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: T0 + 70 * SECOND })
+  })
+
+  it('未到期确认是幂等空操作', () => {
+    const s = agitated()
+    expect(acknowledgeAgitation(s, T0 + 5 * SECOND)).toBe(s)
+  })
+
+  it('休眠漏过多个周期只显示一次待确认提示（不堆叠）', () => {
+    // 间隔 30s；息屏后在 T0+125s 才恢复，显影校准得足够长，仍落在显影
+    const long: Recipe = { develop: 600, stop: 30, fix: 300 }
+    let s = startTimer(long, T0, 1, undefined, 30)
+    // 直接“休眠”到 125s 后（理论上错过了 30/60/90/120 共 4 次）
+    s = advance(s, T0 + 125 * SECOND)
+    expect(s.timer).toEqual({ status: 'running', stage: 'develop', deadline: T0 + 600 * SECOND })
+    const view = agitationView(s, T0 + 125 * SECOND)
+    expect(view).toEqual({ due: true, remainingSeconds: 0, intervalSeconds: 30 })
+    // 持久化中也只有一条 nextAt 记录，没有周期队列
+    expect(s.agitation && 'nextAt' in s.agitation).toBe(true)
+    // 确认后只安排一次新的提示
+    s = acknowledgeAgitation(s, T0 + 125 * SECOND)
+    expect(s.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: T0 + 155 * SECOND })
+  })
+
+  it('显影期内第二次提示同样可到期、确认', () => {
+    // 间隔 30s、显影 120s：T0+30 确认后下一次为 T0+60
+    const long = startTimer({ develop: 120, stop: 30, fix: 300 }, T0, 1, undefined, 30)
+    let l = acknowledgeAgitation(advance(long, T0 + 30 * SECOND), T0 + 30 * SECOND)
+    expect(agitationView(l, T0 + 59 * SECOND)?.due).toBe(false)
+    l = advance(l, T0 + 60 * SECOND)
+    expect(agitationView(l, T0 + 60 * SECOND)?.due).toBe(true)
+    l = acknowledgeAgitation(l, T0 + 60 * SECOND)
+    expect(l.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: T0 + 90 * SECOND })
+  })
+})
+
+describe('搅动节奏随暂停冻结 / 继续重建', () => {
+  it('暂停冻结距下次提示的剩余毫秒，暂停期间不流逝', () => {
+    const s = startTimer(recipe, T0, 1, undefined, 30)
+    const paused = pauseTimer(s, T0 + 5 * SECOND)
+    expect(paused.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 25 * SECOND })
+
+    // 暂停很久后墙钟推进：冻结剩余不变
+    const later = advance(paused, T0 + 320 * SECOND)
+    expect(later.timer.status).toBe('paused')
+    expect(later.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 25 * SECOND })
+    expect(agitationView(later, T0 + 320 * SECOND)).toEqual({
+      due: false,
+      remainingSeconds: 25,
+      intervalSeconds: 30,
+    })
+  })
+
+  it('继续时以冻结剩余重建绝对时刻，保持同一节奏', () => {
+    const s = startTimer(recipe, T0, 1, undefined, 30)
+    const paused = pauseTimer(s, T0 + 5 * SECOND) // 冻结 25s
+    const resumeAt = T0 + 200 * SECOND
+    const resumed = resumeTimer(paused, resumeAt)
+    expect(resumed.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: resumeAt + 25 * SECOND })
+    // 重建后 25 秒到期
+    expect(agitationView(resumeTimer(paused, resumeAt), resumeAt + 24 * SECOND)?.due).toBe(false)
+    const due = advance(resumed, resumeAt + 25 * SECOND)
+    expect(agitationView(due, resumeAt + 25 * SECOND)?.due).toBe(true)
+  })
+
+  it('暂停时提示恰已到期：冻结剩余 0，继续后立即待确认', () => {
+    const s = startTimer({ develop: 120, stop: 30, fix: 300 }, T0, 1, undefined, 30)
+    const paused = pauseTimer(advance(s, T0 + 40 * SECOND), T0 + 40 * SECOND)
+    expect(paused.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 0 })
+    const resumeAt = T0 + 500 * SECOND
+    const resumed = resumeTimer(paused, resumeAt)
+    expect(resumed.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: resumeAt })
+    expect(agitationView(resumed, resumeAt)?.due).toBe(true)
+  })
+
+  it('刷新暂停态后再继续：节奏从持久化的冻结剩余恢复', () => {
+    const s = startTimer(recipe, T0, 1, undefined, 30)
+    const paused = pauseTimer(s, T0 + 12 * SECOND)
+    saveRecord(paused)
+    const loaded = loadRecord()
+    expect(loaded && isPersistedState(loaded) && loaded.agitation).toEqual({
+      status: 'paused',
+      intervalSeconds: 30,
+      remainingMs: 18 * SECOND,
+    })
+    const resumeAt = T0 + 999 * SECOND
+    const resumed = resumeTimer(loaded as PersistedState, resumeAt)
+    expect(resumed.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: resumeAt + 18 * SECOND })
+  })
+})
+
+describe('搅动提示仅在显影阶段存在', () => {
+  it('短显影到期跨入停显：agitation 被清除', () => {
+    const s = startTimer({ develop: 10, stop: 30, fix: 300 }, T0, 1, undefined, 5)
+    // T0+5 首次搅动到期
+    expect(agitationView(advance(s, T0 + 5 * SECOND), T0 + 5 * SECOND)?.due).toBe(true)
+    // 不确认，继续走到 T0+12：已跨入停显，搅动字段消失
+    const inStop = advance(s, T0 + 12 * SECOND)
+    expect(inStop.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 40 * SECOND })
+    expect(inStop.agitation).toBeUndefined()
+    expect(agitationView(inStop, T0 + 12 * SECOND)).toBeNull()
+
+    // 定影阶段同样没有
+    const inFix = advance(inStop, T0 + 45 * SECOND)
+    expect(inFix.timer).toEqual({ status: 'running', stage: 'fix', deadline: T0 + 340 * SECOND })
+    expect(inFix.agitation).toBeUndefined()
+  })
+
+  it('恰在显影截止点跨入停显时，即便搅动 nextAt 同时刻也清除（不提示）', () => {
+    const s = startTimer({ develop: 30, stop: 30, fix: 300 }, T0, 1, undefined, 30)
+    const next = advance(s, T0 + 30 * SECOND)
+    expect(next.timer.status).toBe('running')
+    expect(next.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 60 * SECOND })
+    expect(next.agitation).toBeUndefined()
+  })
+
+  it('在停显暂停：不携带搅动字段；继续后也没有', () => {
+    const s = startTimer({ develop: 10, stop: 30, fix: 300 }, T0, 1, undefined, 5)
+    const inStop = advance(s, T0 + 12 * SECOND)
+    const paused = pauseTimer(inStop, T0 + 12 * SECOND)
+    expect(paused.timer.status).toBe('paused')
+    expect(paused.agitation).toBeUndefined()
+    expect(resumeTimer(paused, T0 + 100 * SECOND).agitation).toBeUndefined()
+  })
+
+  it('完成与回拨锁定时清除搅动', () => {
+    const s = startTimer({ develop: 1, stop: 1, fix: 1 }, T0, 1, undefined, 1)
+    const done = advance(s, T0 + 3 * SECOND)
+    expect(done.timer).toEqual({ status: 'done' })
+    expect(done.agitation).toBeUndefined()
+
+    const running = startTimer({ develop: 60, stop: 30, fix: 300 }, T0, 1, undefined, 10)
+    running.lastWallClock = T0 + 100 * SECOND
+    const locked = advance(running, T0 + 50 * SECOND)
+    expect(locked.timer.status).toBe('locked')
+    expect(locked.agitation).toBeUndefined()
+  })
+})
+
+describe('搅动 — 旧记录解析与损坏拒绝', () => {
+  it('不含 agitation 字段的旧记录按未启用读取，视图为 null 且时间线照常', () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        rev: 1,
+        recipe: { develop: 60, stop: 30, fix: 300 },
+        timer: { status: 'running', stage: 'develop', deadline: T0 + 60 * SECOND },
+        lastWallClock: T0,
+      }),
+    )
+    const loaded = loadRecord()
+    expect(loaded && isPersistedState(loaded)).toBe(true)
+    if (loaded && isPersistedState(loaded)) {
+      expect(loaded.agitation).toBeUndefined()
+      expect(agitationView(loaded, T0 + 10 * SECOND)).toBeNull()
+      const next = advance(loaded, T0 + 65 * SECOND)
+      expect(next.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 90 * SECOND })
+      expect(next.agitation).toBeUndefined()
+    }
+  })
+
+  it('合法的运行/暂停搅动记录可完整往返', () => {
+    const running = startTimer(recipe, T0, 1, undefined, 30)
+    saveRecord(running)
+    expect(loadRecord()).toEqual(running)
+
+    const paused = pauseTimer(running, T0 + 10 * SECOND)
+    saveRecord(paused)
+    expect(loadRecord()).toEqual(paused)
+  })
+
+  const seedAgitation = (agitation: unknown, timer: unknown = undefined) => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        rev: 1,
+        recipe: { develop: 60, stop: 30, fix: 300 },
+        agitation,
+        timer:
+          timer ?? { status: 'running', stage: 'develop', deadline: T0 + 60 * SECOND },
+        lastWallClock: T0,
+      }),
+    )
+  }
+
+  it('间隔越界/非整数的搅动字段导致整条记录拒绝', () => {
+    seedAgitation({ status: 'running', intervalSeconds: 9, nextAt: T0 + 9 * SECOND })
+    expect(loadRecord()).toBeNull()
+    seedAgitation({ status: 'running', intervalSeconds: 301, nextAt: T0 + 301 * SECOND })
+    expect(loadRecord()).toBeNull()
+    seedAgitation({ status: 'running', intervalSeconds: 30.5, nextAt: T0 + 30 * SECOND })
+    expect(loadRecord()).toBeNull()
+  })
+
+  it('缺少 nextAt/remainingMs 或状态与 timer 不一致的搅动字段拒绝', () => {
+    seedAgitation({ status: 'running', intervalSeconds: 30 })
+    expect(loadRecord()).toBeNull()
+    seedAgitation(
+      { status: 'running', intervalSeconds: 30, nextAt: T0 + 30 * SECOND },
+      { status: 'paused', stage: 'develop', remainingMs: 40 * SECOND },
+    )
+    expect(loadRecord()).toBeNull()
+    seedAgitation({ status: 'paused', intervalSeconds: 30, remainingMs: -1 })
+    expect(loadRecord()).toBeNull()
+    seedAgitation({ status: 'paused', intervalSeconds: 30, remainingMs: 20 * SECOND })
+    expect(loadRecord()).toBeNull()
+    seedAgitation({ status: 'soon', intervalSeconds: 30 })
+    expect(loadRecord()).toBeNull()
+  })
+
+  it('搅动只允许在显影：停显/完成/锁定态带 agitation 一律拒绝', () => {
+    seedAgitation(
+      { status: 'running', intervalSeconds: 30, nextAt: T0 + 30 * SECOND },
+      { status: 'running', stage: 'stop', deadline: T0 + 90 * SECOND },
+    )
+    expect(loadRecord()).toBeNull()
+    seedAgitation({ status: 'running', intervalSeconds: 30, nextAt: T0 }, { status: 'done' })
+    expect(loadRecord()).toBeNull()
+    seedAgitation(
+      { status: 'running', intervalSeconds: 30, nextAt: T0 },
+      { status: 'locked', lastWallClock: T0 + 1000, observedAt: T0 },
+    )
+    expect(loadRecord()).toBeNull()
+  })
+})
+
+describe('搅动确认的多标签 rev 仲裁', () => {
+  it('确认以更高 rev 提交后，旧标签的陈旧 running tick 不能让提示复活', () => {
+    const running = startTimer({ develop: 120, stop: 30, fix: 300 }, T0, 1, undefined, 30)
+    commitRecord(running)
+
+    // 标签 B 在 T0+30 确认，rev=2，下一次 T0+60
+    const acked = withRev(acknowledgeAgitation(advance(running, T0+30*SECOND), T0+30*SECOND), 2)
+    expect(commitRecord(acked)).toEqual(acked)
+
+    // 标签 A 的陈旧 tick（rev=1，agitation 仍指向 T0+30，已到期）写回被拒
+    const stale = advance(running, T0 + 31 * SECOND)
+    const result = commitRecord(stale)
+    expect(result).toEqual(acked)
+    const stored = loadRecord()
+    expect(stored).toEqual(acked)
+    if (stored && isPersistedState(stored) && stored.agitation?.status === 'running') {
+      expect(stored.agitation.nextAt).toBe(T0 + 60 * SECOND)
+    } else {
+      expect.unreachable('存储应保持确认后的搅动节奏')
+    }
+  })
+
+  it('确认提交若已被其它标签处理：本标签读到的高 rev 记录未到期，幂等采纳', () => {
+    // 标签 B 已在 T0+32 确认并提交 rev=2（nextAt T0+62）
+    const running = startTimer({ develop: 120, stop: 30, fix: 300 }, T0, 1, undefined, 30)
+    commitRecord(running)
+    const acked = withRev(acknowledgeAgitation(advance(running, T0 + 32 * SECOND), T0 + 32 * SECOND), 2)
+    commitRecord(acked)
+
+    // 标签 A 在 T0+33 才点确认：基线从存储读到 rev=2，其 nextAt=T0+62 未到期
+    const base = loadRecord()
+    expect(base && isPersistedState(base)).toBe(true)
+    if (base && isPersistedState(base)) {
+      const next = acknowledgeAgitation(base, T0 + 33 * SECOND)
+      expect(next).toBe(base) // 幂等空操作，直接采纳较高修订记录
+    }
+  })
+
+  it('暂停/继续搅动会话后，同 rev 的运行 tick 正常跟进节奏', () => {
+    const running = startTimer(recipe, T0, 1, undefined, 30)
+    commitRecord(running)
+    const paused = withRev(pauseTimer(running, T0 + 10 * SECOND), 2)
+    commitRecord(paused)
+    const resumed = withRev(resumeTimer(paused, T0 + 100 * SECOND), 3)
+    expect(commitRecord(resumed)).toEqual(resumed)
+    if (resumed.agitation?.status === 'running') {
+      // 冻结 20s → nextAt = T0+100s+20s
+      expect(resumed.agitation.nextAt).toBe(T0 + 120 * SECOND)
+    } else {
+      expect.unreachable('继续后应为运行态搅动节奏')
+    }
   })
 })
