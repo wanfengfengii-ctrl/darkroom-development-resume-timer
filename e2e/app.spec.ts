@@ -12,6 +12,23 @@ async function seedAndReload(page: Page, state: unknown): Promise<void> {
   await page.reload()
 }
 
+/**
+ * 冻结周期性 tick 后再种入状态：保留挂载时的一次性推进，但之后即使墙钟越过
+ * deadline，200ms 的自动推进也不会发生——精确复现「倒计时已归零但界面尚未推进」
+ * （或显影已结束但面板尚未推进）的临界窗口。
+ */
+async function seedFrozenTicksAndReload(page: Page, state: unknown): Promise<void> {
+  await page.addInitScript(() => {
+    window.setInterval = (() => 0) as unknown as typeof window.setInterval
+  })
+  await page.goto('/')
+  await page.evaluate(
+    ([key, value]) => localStorage.setItem(key, JSON.stringify(value)),
+    [STORAGE_KEY, state] as const,
+  )
+  await page.reload()
+}
+
 async function fillRecipe(page: Page, d: string, s: string, f: string): Promise<void> {
   await page.getByTestId('start-button').waitFor()
   await page.locator('#input-develop').fill(d)
@@ -665,6 +682,107 @@ test.describe('显影搅动提醒', () => {
     await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
     await expect(page.getByTestId('current-stage')).toHaveText('停显', { timeout: 8_000 })
     await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+  })
+
+  test('显影搅动到期后才暂停：暂停态继续明确显示需要搅动，而非冻结剩余 0 秒', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      // 暂停时提示恰好已到期：冻结剩余 0 且 due=true（暂停瞬间已待确认）
+      agitation: { status: 'paused', intervalSeconds: 30, remainingMs: 0, due: true },
+      timer: { status: 'paused', stage: 'develop', remainingMs: 40_000 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+
+    const prompt = page.getByTestId('agitation-prompt')
+    // 必须继续突出「请搅动」并提供确认，绝不能变成「冻结剩余 0 秒」
+    await expect(prompt).toHaveAttribute('data-due', 'true')
+    await expect(prompt).toContainText('请搅动')
+    await expect(page.getByTestId('agitation-confirm')).toBeVisible()
+    await expect(prompt).not.toContainText('冻结')
+    // 显影倒计时的冻结剩余不受影响
+    await expect(page.getByTestId('seconds')).toHaveText('40')
+
+    // 暂停期间也可确认：冻结剩余恢复为完整间隔，继续后满量起倒数
+    await page.getByTestId('agitation-confirm').click()
+    await expect(prompt).toHaveAttribute('data-due', 'false')
+    await expect(prompt).toContainText('暂停中：搅动提示已冻结，剩余')
+    await expect(page.getByTestId('agitation-remaining')).toHaveText('30')
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+  })
+
+  test('无 due 字段的旧暂停记录在冻结剩余 0 时恢复为待确认，不把进行中的会话整体拒绝', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      // 旧版本写入的暂停搅动记录没有 due 字段；remainingMs=0 本身就意味着到期
+      agitation: { status: 'paused', intervalSeconds: 30, remainingMs: 0 },
+      timer: { status: 'paused', stage: 'develop', remainingMs: 40_000 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+    await expect(page.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'true')
+    await expect(page.getByTestId('agitation-confirm')).toBeVisible()
+  })
+
+  test('显影倒计时已归零但界面尚未推进时校准：进入停显，而不是重新延长显影', async ({ page }) => {
+    const now = Date.now()
+    // 挂载时显影还有 1.5 秒；随后冻结自动 tick，墙钟越过 deadline 而面板仍停在显影
+    await seedFrozenTicksAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 1_500 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 墙钟越过显影截止时间，但因 tick 冻结，界面尚未推进（仍显示显影阶段）
+    await page.waitForTimeout(2_000)
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 此时校准剩余为 120 秒：必须先跨入停显，校准作用于停显
+    await page.getByTestId('calibrate-input').fill('120')
+    await page.getByTestId('calibrate-button').click()
+    await expect(page.getByTestId('current-stage')).toHaveText('停显')
+    await expect(page.getByTestId('seconds')).toHaveText('120')
+    // 显影绝不能被重新延长
+    const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.timer.stage).toBe('stop')
+    expect(stored.timer.deadline).toBeGreaterThan(now + 100_000)
+  })
+
+  test('显影已结束但面板尚未推进时点已搅动：结束显影进入停显，不排下一次提示', async ({ page }) => {
+    const now = Date.now()
+    // 搅动早已到期（nextAt 在 100 秒前）；显影 1.5 秒后才截止，挂载时仍停留在显影
+    await seedFrozenTicksAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      agitation: { status: 'running', intervalSeconds: 30, nextAt: now - 100_000 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 1_500 },
+      lastWallClock: now - 100_000,
+    })
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    await expect(page.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'true')
+
+    // 墙钟越过显影截止时间，但 tick 冻结：面板尚未推进，确认按钮仍在
+    await page.waitForTimeout(2_000)
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 点击已搅动：显影已结束，确认不再被接受，阶段进入停显，搅动提示整体消失
+    await page.getByTestId('agitation-confirm').click()
+    await expect(page.getByTestId('current-stage')).toHaveText('停显')
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+    await expect(page.getByTestId('agitation-confirm')).toHaveCount(0)
+    const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.timer.stage).toBe('stop')
+    expect(stored.agitation).toBeUndefined()
   })
 
   test('一个标签确认搅动后，另一个标签的待确认提示同步消失', async ({ context }) => {

@@ -446,6 +446,36 @@ describe('校准剩余时间', () => {
     }
   })
 
+  it('显影倒计时已归零但界面尚未推进时校准：先跨入停显，校准作用于停显而非延长显影', () => {
+    // 显影 60s、搅动 30s；T0+60s 时显影与待确认搅动都已到期，但记录尚未经 tick 推进
+    const s = startTimer(recipe, T0, 1, undefined, 30)
+    const calibrated = calibrateTimer(s, 90, T0 + 60 * SECOND)
+    expect(calibrated.timer).toEqual({
+      status: 'running',
+      stage: 'stop',
+      deadline: T0 + 60 * SECOND + 90 * SECOND,
+    })
+    // 跨入停显，搅动字段一并清除，绝不会给已结束的显影续命
+    expect(calibrated.agitation).toBeUndefined()
+  })
+
+  it('显影逾期较久才校准：未消费的逾期时长先连续跨阶段，校准落在实际所在阶段', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    // T0+65s：显影已过 5s，本应在停显剩 25s
+    const calibrated = calibrateTimer(s, 90, T0 + 65 * SECOND)
+    expect(calibrated.timer).toEqual({
+      status: 'running',
+      stage: 'stop',
+      deadline: T0 + 65 * SECOND + 90 * SECOND,
+    })
+  })
+
+  it('全部阶段已耗尽时校准不复活任何阶段，结果为完成', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    const calibrated = calibrateTimer(s, 90, T0 + 390 * SECOND)
+    expect(calibrated.timer).toEqual({ status: 'done' })
+  })
+
   it('暂停态：替换已保存的剩余毫秒，阶段保持不变', () => {
     const s = runningAt(0, T0, T0 + 60 * SECOND)
     const paused = pauseTimer(s, T0 + 20 * SECOND) // 显影剩 40s
@@ -881,6 +911,27 @@ describe('搅动提示到期与确认（固定墙钟）', () => {
     expect(acknowledgeAgitation(s, T0 + 5 * SECOND)).toBe(s)
   })
 
+  it('显影已经结束但界面尚未推进时点已搅动：不再接受确认，结束显影进入停显', () => {
+    // 显影 60s、搅动 30s；记录停留在启动时的状态（尚未经 tick 推进），
+    // 但墙钟已到 T0+60：提示待确认，且显影 deadline 也刚好到期
+    const s = agitated()
+    expect(agitationView(s, T0 + 60 * SECOND)).toEqual({
+      due: true,
+      remainingSeconds: 0,
+      intervalSeconds: 30,
+    })
+    const acked = acknowledgeAgitation(s, T0 + 60 * SECOND)
+    // 正确结果：跨入停显（剩余 30s），搅动字段随显影结束被清除
+    expect(acked.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 90 * SECOND })
+    expect(acked.agitation).toBeUndefined()
+  })
+
+  it('显影已逾期较久时点已搅动：按墙钟连续跨阶段，不排下一次搅动', () => {
+    const acked = acknowledgeAgitation(agitated(), T0 + 65 * SECOND)
+    expect(acked.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 90 * SECOND })
+    expect(acked.agitation).toBeUndefined()
+  })
+
   it('休眠漏过多个周期只显示一次待确认提示（不堆叠）', () => {
     // 间隔 30s；息屏后在 T0+125s 才恢复，显影校准得足够长，仍落在显影
     const long: Recipe = { develop: 600, stop: 30, fix: 300 }
@@ -913,12 +964,12 @@ describe('搅动节奏随暂停冻结 / 继续重建', () => {
   it('暂停冻结距下次提示的剩余毫秒，暂停期间不流逝', () => {
     const s = startTimer(recipe, T0, 1, undefined, 30)
     const paused = pauseTimer(s, T0 + 5 * SECOND)
-    expect(paused.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 25 * SECOND })
+    expect(paused.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 25 * SECOND, due: false })
 
     // 暂停很久后墙钟推进：冻结剩余不变
     const later = advance(paused, T0 + 320 * SECOND)
     expect(later.timer.status).toBe('paused')
-    expect(later.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 25 * SECOND })
+    expect(later.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 25 * SECOND, due: false })
     expect(agitationView(later, T0 + 320 * SECOND)).toEqual({
       due: false,
       remainingSeconds: 25,
@@ -938,14 +989,34 @@ describe('搅动节奏随暂停冻结 / 继续重建', () => {
     expect(agitationView(due, resumeAt + 25 * SECOND)?.due).toBe(true)
   })
 
-  it('暂停时提示恰已到期：冻结剩余 0，继续后立即待确认', () => {
+  it('暂停时提示恰已到期：冻结剩余 0 并保留待确认标记，继续后立即待确认', () => {
     const s = startTimer({ develop: 120, stop: 30, fix: 300 }, T0, 1, undefined, 30)
     const paused = pauseTimer(advance(s, T0 + 40 * SECOND), T0 + 40 * SECOND)
-    expect(paused.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 0 })
+    expect(paused.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 0, due: true })
+    // 暂停期间持续明确提示「需要搅动」，而不是伪装成冻结剩余 0 秒的普通倒计时
+    expect(agitationView(paused, T0 + 500 * SECOND)).toEqual({
+      due: true,
+      remainingSeconds: 0,
+      intervalSeconds: 30,
+    })
     const resumeAt = T0 + 500 * SECOND
     const resumed = resumeTimer(paused, resumeAt)
     expect(resumed.agitation).toEqual({ status: 'running', intervalSeconds: 30, nextAt: resumeAt })
     expect(agitationView(resumed, resumeAt)?.due).toBe(true)
+  })
+
+  it('暂停中确认已到期提示：冻结剩余恢复为完整间隔，继续后满量起倒数', () => {
+    const s = startTimer({ develop: 120, stop: 30, fix: 300 }, T0, 1, undefined, 30)
+    const paused = pauseTimer(advance(s, T0 + 40 * SECOND), T0 + 40 * SECOND)
+    const acked = acknowledgeAgitation(paused, T0 + 500 * SECOND)
+    expect(acked.timer.status).toBe('paused')
+    expect(acked.agitation).toEqual({ status: 'paused', intervalSeconds: 30, remainingMs: 30 * SECOND, due: false })
+    const resumeAt = T0 + 600 * SECOND
+    expect(resumeTimer(acked, resumeAt).agitation).toEqual({
+      status: 'running',
+      intervalSeconds: 30,
+      nextAt: resumeAt + 30 * SECOND,
+    })
   })
 
   it('刷新暂停态后再继续：节奏从持久化的冻结剩余恢复', () => {
@@ -957,6 +1028,7 @@ describe('搅动节奏随暂停冻结 / 继续重建', () => {
       status: 'paused',
       intervalSeconds: 30,
       remainingMs: 18 * SECOND,
+      due: false,
     })
     const resumeAt = T0 + 999 * SECOND
     const resumed = resumeTimer(loaded as PersistedState, resumeAt)

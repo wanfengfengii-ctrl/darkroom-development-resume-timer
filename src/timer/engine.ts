@@ -61,12 +61,14 @@ export const AGITATION_MAX = 300
  * 搅动节奏，只在显影阶段生效；随暂停/继续在「绝对时刻」与「冻结剩余」间转换：
  *  - running：下一次提示的绝对墙钟时刻 nextAt，now >= nextAt 即待确认，
  *    漏过多少个周期都只是同一条待确认提示，确认后按确认时刻重排
- *  - paused：暂停瞬间冻结的距下次提示剩余毫秒，暂停期间不流逝
+ *  - paused：暂停瞬间冻结的距下次提示剩余毫秒，暂停期间不流逝；
+ *    due 记录暂停时提示是否已待确认——到期后才暂停也要继续明确提示搅动，
+ *    不能把一条待确认提示伪装成「冻结剩余 0 秒」的普通倒计时
  * 跨入停显/定影、完成或回拨锁定时该字段整体清除。
  */
 export type AgitationState =
   | { status: 'running'; intervalSeconds: number; nextAt: number }
-  | { status: 'paused'; intervalSeconds: number; remainingMs: number }
+  | { status: 'paused'; intervalSeconds: number; remainingMs: number; due: boolean }
 
 /** 运行中：阶段由 deadline 驱动 */
 export interface RunningState {
@@ -331,27 +333,14 @@ export function resetTombstone(rev: number): ResetTombstone {
 }
 
 /**
- * 恢复/推进状态机：根据当前墙钟与 deadline 的关系推进。
- * 若已逾期，用「未消费的逾期时长」连续跨过后续阶段；全部耗尽则完成。
+ * 运行态按墙钟推进：未到点只刷新最近墙钟；已到点则用「未消费的逾期时长」
+ * 连续跨过后续阶段，全部耗尽则完成。调用方需保证 timer.status === 'running'。
  *
- * 另负责时钟回拨检测：now < lastWallClock 时立即锁定。
- *
- * 搅动提醒只属于显影：跨入停显/定影、完成或锁定时整体清除 agitation；
+ * 搅动提醒只属于显影：跨入停显/定影或完成时整体清除 agitation；
  * 仍在显影运行时保留（是否到期由 nextAt 与墙钟比较得出，漏过的周期自然合并）。
  */
-export function advance(state: PersistedState, now: number): PersistedState {
-  if (now < state.lastWallClock) {
-    return {
-      ...state,
-      agitation: undefined,
-      timer: { status: 'locked', lastWallClock: state.lastWallClock, observedAt: now },
-    }
-  }
-  if (state.timer.status !== 'running') {
-    return { ...state, lastWallClock: now }
-  }
-
-  let { stage, deadline } = state.timer
+function advanceRunning(state: PersistedState, now: number): PersistedState {
+  let { stage, deadline } = state.timer as RunningState
   // 未到点：原样返回
   if (deadline > now) {
     return { ...state, lastWallClock: now }
@@ -377,6 +366,26 @@ export function advance(state: PersistedState, now: number): PersistedState {
   }
 }
 
+/**
+ * 恢复/推进状态机：根据当前墙钟与 deadline 的关系推进。
+ * 若已逾期，用「未消费的逾期时长」连续跨过后续阶段；全部耗尽则完成。
+ *
+ * 另负责时钟回拨检测：now < lastWallClock 时立即锁定。
+ */
+export function advance(state: PersistedState, now: number): PersistedState {
+  if (now < state.lastWallClock) {
+    return {
+      ...state,
+      agitation: undefined,
+      timer: { status: 'locked', lastWallClock: state.lastWallClock, observedAt: now },
+    }
+  }
+  if (state.timer.status !== 'running') {
+    return { ...state, lastWallClock: now }
+  }
+  return advanceRunning(state, now)
+}
+
 /** 暂停：保存当前剩余毫秒（刷新后仍为暂停） */
 export function pauseTimer(state: PersistedState, now: number): PersistedState {
   const advanced = advance(state, now)
@@ -384,13 +393,15 @@ export function pauseTimer(state: PersistedState, now: number): PersistedState {
   const remainingMs = Math.max(0, advanced.timer.deadline - now)
   return {
     ...advanced,
-    // 冻结距下次搅动提示的剩余毫秒；暂停期间不流逝
+    // 冻结距下次搅动提示的剩余毫秒；暂停期间不流逝。到期后才暂停时 due=true，
+    // 暂停态继续明确显示「请搅动」，而不是伪装成剩余 0 秒的普通倒计时
     ...(advanced.agitation && advanced.agitation.status === 'running'
       ? {
           agitation: {
             status: 'paused',
             intervalSeconds: advanced.agitation.intervalSeconds,
             remainingMs: Math.max(0, advanced.agitation.nextAt - now),
+            due: advanced.agitation.nextAt <= now,
           } satisfies AgitationState,
         }
       : {}),
@@ -427,9 +438,10 @@ export function resumeTimer(state: PersistedState, now: number): PersistedState 
 
 /**
  * 校准剩余时间：把当前阶段的剩余时间改为指定秒数（1–1800，由调用方校验）。
- *  - 运行态：以当前墙钟重建绝对截止时间 deadline = now + seconds
+ *  - 运行态：先按墙钟补推进（显影已归零却尚未由 tick 推进时跨入停显/完成），
+ *    再以当前墙钟重建「推进后所在阶段」的绝对截止时间 deadline = now + seconds
  *  - 暂停态：替换已保存的剩余毫秒 remainingMs = seconds
- * 两种情况阶段都保持不变；完成/锁定态不接受校准。
+ * 两种情况阶段都保持校准瞬间的当前阶段不变；完成/锁定态不接受校准。
  * 与暂停/继续一致，时钟回拨优先于校准：回拨时改为锁定。
  */
 export function calibrateTimer(state: PersistedState, seconds: number, now: number): PersistedState {
@@ -440,33 +452,61 @@ export function calibrateTimer(state: PersistedState, seconds: number, now: numb
       timer: { status: 'locked', lastWallClock: state.lastWallClock, observedAt: now },
     }
   }
-  const timer = state.timer
-  if (timer.status === 'running') {
+  const timer0 = state.timer
+  // 暂停态：墙钟不消耗，直接替换冻结剩余；完成/锁定态不接受校准（原样返回）
+  if (timer0.status === 'done' || timer0.status === 'locked') return state
+  if (timer0.status === 'paused') {
     return {
       ...state,
-      timer: { status: 'running', stage: timer.stage, deadline: now + seconds * 1000 },
+      timer: { status: 'paused', stage: timer0.stage, remainingMs: seconds * 1000 },
       lastWallClock: now,
     }
   }
-  if (timer.status === 'paused') {
-    return {
-      ...state,
-      timer: { status: 'paused', stage: timer.stage, remainingMs: seconds * 1000 },
-      lastWallClock: now,
-    }
+
+  // 运行态：先消费已到期的阶段——显影倒计时已归零（界面尚未被 tick 推进）时
+  // 校准，必须先进入停显/完成，绝不能把已结束的显影按校准秒数重新延长
+  const advanced = advanceRunning(state, now)
+  const timer = advanced.timer
+  if (timer.status !== 'running') return advanced
+  return {
+    ...advanced,
+    timer: { status: 'running', stage: timer.stage, deadline: now + seconds * 1000 },
+    lastWallClock: now,
   }
-  return state
 }
 
 /**
- * 确认搅动：仅当显影运行中且提示已到期（now >= nextAt）时，按当前墙钟排定
- * 下一次提示 nextAt = now + interval；其余情况原样返回（幂等）。
- * 休眠漏过多个周期也只会有一条待确认提示，确认后节奏从确认时刻重新起算。
+ * 确认搅动：
+ *  - 显影运行中、尚未到点（deadline > now）且提示已到期（now >= nextAt）：
+ *    按当前墙钟排定下一次提示 nextAt = now + interval
+ *  - 显影暂停中且暂停时提示已到期（冻结剩余 0、due=true）：确认后把冻结剩余
+ *    恢复为完整间隔，继续后从间隔满量起倒数；暂停期间仍不流逝
+ * 显影已经结束（deadline <= now，界面尚未被 tick 推进）时不再接受确认，
+ * 而是按墙钟推进——结束显影并跨入停显/完成，绝不会排定下一次搅动提示。
+ * 其余无提示可确认的情况原样返回（幂等）。
  */
 export function acknowledgeAgitation(state: PersistedState, now: number): PersistedState {
   const a = state.agitation
-  if (state.timer.status !== 'running' || state.timer.stage !== 'develop') return state
+
+  if (state.timer.status === 'paused') {
+    if (state.timer.stage !== 'develop' || !a || a.status !== 'paused' || !a.due) return state
+    return {
+      ...state,
+      agitation: {
+        status: 'paused',
+        intervalSeconds: a.intervalSeconds,
+        remainingMs: a.intervalSeconds * 1000,
+        due: false,
+      },
+      lastWallClock: now,
+    }
+  }
+
+  if (state.timer.status !== 'running') return state
+  if (state.timer.stage !== 'develop') return state
   if (!a || a.status !== 'running' || a.nextAt > now) return state
+  // 显影已到期：确认无效，让阶段正常结束（advance 会一并清除 agitation）
+  if (state.timer.deadline <= now) return advance(state, now)
   return {
     ...state,
     agitation: { status: 'running', intervalSeconds: a.intervalSeconds, nextAt: now + a.intervalSeconds * 1000 },
@@ -489,7 +529,8 @@ export function agitationView(state: PersistedState, now: number): AgitationView
   if (!a) return null
   if (a.status === 'paused') {
     return {
-      due: false,
+      // 暂停时已待确认的提示不能伪装成「冻结剩余 0 秒」：继续明确要求搅动
+      due: a.due,
       remainingSeconds: Math.max(0, Math.ceil(a.remainingMs / 1000)),
       intervalSeconds: a.intervalSeconds,
     }
@@ -600,7 +641,16 @@ function reviveAgitation(v: unknown, timer: TimerState): AgitationState | null {
   }
   if (a.status === 'paused') {
     if (timer.status !== 'paused' || !isFiniteInteger(a.remainingMs) || a.remainingMs < 0) return null
-    return { status: 'paused', intervalSeconds: a.intervalSeconds, remainingMs: a.remainingMs }
+    // due 只可能与冻结剩余 0 同时出现（到期即 nextAt<=now，冻结剩余必为 0）。
+    // 旧版本写入的暂停记录没有 due 字段：按该不变量推导，避免把进行中的会话整体拒绝
+    const derivedDue = a.remainingMs === 0
+    if (a.due !== undefined && (typeof a.due !== 'boolean' || a.due !== derivedDue)) return null
+    return {
+      status: 'paused',
+      intervalSeconds: a.intervalSeconds,
+      remainingMs: a.remainingMs,
+      due: derivedDue,
+    }
   }
   return null
 }
