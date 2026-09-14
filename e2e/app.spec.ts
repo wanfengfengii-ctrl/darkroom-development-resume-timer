@@ -181,6 +181,53 @@ test.describe('液温修正', () => {
     await expect(source).toContainText('未做液温修正')
     expect(await readSeconds(page)).toBeGreaterThan(59)
   })
+
+  test('18℃ 修正的冲洗完成后，结果页仍标明本轮液温与修正时长', async ({ page }) => {
+    await page.goto('/')
+    // 基准显影 4s @18℃ → 5s，停显/定影各 1s，约 7s 走完
+    await fillRecipe(page, '4', '1', '1')
+    await setTemperature(page, '18')
+    await page.getByTestId('start-button').click()
+    await expect(page.getByTestId('done-title')).toBeVisible({ timeout: 15_000 })
+
+    const source = page.getByTestId('temp-source')
+    await expect(source).toHaveAttribute('data-corrected', 'true')
+    await expect(source).toContainText('18℃')
+    await expect(source).toContainText('基准 4')
+    await expect(source).toContainText('5')
+
+    // 刷新后仍是完成结果，温度来源不丢失
+    await page.reload()
+    await expect(page.getByTestId('done-title')).toBeVisible()
+    await expect(page.getByTestId('temp-source')).toContainText('18℃')
+    await expect(page.getByTestId('temp-source')).toContainText('基准 4')
+  })
+
+  test('18℃ 修正的会话因时钟回拨锁定后，锁定页仍标明本轮液温与修正时长', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 76, stop: 30, fix: 300 },
+      temperature: { temperature: 18, baseDevelop: 60 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 76_000 },
+      // 最近墙钟在 2 分钟后，当前时间更早，构成回拨
+      lastWallClock: now + 120_000,
+    })
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'locked')
+
+    const source = page.getByTestId('temp-source')
+    await expect(source).toHaveAttribute('data-corrected', 'true')
+    await expect(source).toContainText('18℃')
+    await expect(source).toContainText('基准 60')
+    await expect(source).toContainText('76')
+
+    // 刷新后锁定保持，温度来源仍在
+    await page.reload()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'locked')
+    await expect(page.getByTestId('temp-source')).toContainText('18℃')
+    await expect(page.getByTestId('temp-source')).toContainText('76')
+  })
 })
 
 test.describe('刷新续时', () => {

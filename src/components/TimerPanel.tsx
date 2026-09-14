@@ -93,6 +93,7 @@ export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onReset
         <p className="hint">
           为避免已过去的药浴阶段被错误重走，计时已停止。请校准设备时钟后，只能通过「重置」清除锁定并重新开始。
         </p>
+        <TemperatureSource state={state} />
         <button type="button" className="btn danger" onClick={onReset} data-testid="reset-button">
           重置
         </button>
@@ -106,6 +107,7 @@ export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onReset
         <h2 data-testid="done-title">🎉 冲洗完成</h2>
         <p>显影、停显、定影三个阶段均已完成，可以取出胶片。</p>
         <StageStepper currentIndex={STAGE_IDS.length} />
+        <TemperatureSource state={state} />
         <button type="button" className="btn primary" onClick={onReset} data-testid="reset-button">
           开始新一轮冲洗
         </button>
