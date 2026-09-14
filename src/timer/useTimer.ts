@@ -14,6 +14,7 @@ import {
   type PersistedState,
   type Recipe,
   type StoredRecord,
+  type TemperatureInfo,
 } from './engine'
 
 /**
@@ -29,7 +30,7 @@ import {
 export function useTimer(): {
   state: PersistedState | null
   now: number
-  start: (recipe: Recipe) => void
+  start: (recipe: Recipe, temperature?: TemperatureInfo) => void
   pause: () => void
   resume: () => void
   calibrate: (seconds: number) => void
@@ -116,12 +117,12 @@ export function useTimer(): {
   }, [adopt, syncFromStorage])
 
   const start = useCallback(
-    (recipe: Recipe) => {
+    (recipe: Recipe, temperature?: TemperatureInfo) => {
       const t = Date.now()
       setNow(t)
       const base = loadRecord() ?? recordRef.current
       const rev = (base ? base.rev : 0) + 1
-      adopt(commitRecord(startTimer(recipe, t, rev)))
+      adopt(commitRecord(startTimer(recipe, t, rev, temperature)))
     },
     [adopt],
   )

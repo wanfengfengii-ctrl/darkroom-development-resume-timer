@@ -179,6 +179,98 @@ body {
   padding: 12px 16px;
 }
 
+/* ---- 可选液温修正 ---- */
+
+.temp-corrected-tag {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 400;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(232, 163, 61, 0.16);
+  color: var(--amber);
+}
+
+.field-temperature {
+  margin-bottom: 22px;
+  padding-top: 4px;
+}
+
+.field-temperature .field-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 15px;
+}
+
+.temp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.temp-row input {
+  width: 100%;
+  font-size: 20px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.temp-row input:focus {
+  outline: 2px solid var(--amber);
+  outline-offset: 1px;
+}
+
+.temp-row input[aria-invalid="true"] {
+  border-color: var(--red);
+  outline-color: var(--red);
+}
+
+.temp-preview {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--amber);
+}
+
+.temp-preview strong {
+  font-size: 15px;
+}
+
+.temp-hint {
+  margin: 8px 0 0;
+}
+
+.temp-error {
+  white-space: normal;
+  margin: 8px 0 0;
+}
+
+/* 计时面板：本轮温度修正来源 */
+.temp-source {
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0 0 14px;
+  padding: 8px 12px;
+  border-radius: 10px;
+}
+
+.temp-source-on {
+  background: rgba(232, 163, 61, 0.12);
+  border: 1px solid var(--amber-dim);
+  color: var(--text);
+}
+
+.temp-source-none {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
 form .btn.primary {
   width: 100%;
 }

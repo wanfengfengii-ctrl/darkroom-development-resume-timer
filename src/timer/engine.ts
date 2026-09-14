@@ -33,6 +33,24 @@ export interface Recipe {
 
 export type RecipeInput = Record<StageId, string>
 
+// ---- 液温修正 ----
+
+/** 配方基准温度（℃）：等于该温度时不做任何修正 */
+export const TEMP_BASELINE = 20
+/** 允许输入的液温范围（℃） */
+export const TEMP_MIN = 18
+export const TEMP_MAX = 24
+/** 液温最小递增单位（℃） */
+export const TEMP_STEP = 0.5
+
+/** 随会话持久化的温度修正来源；停显/定影不参与换算，故只记录显影基准值 */
+export interface TemperatureInfo {
+  /** 启动时填写的当前液温（℃），取值 18–24 且为 0.5 的整数倍 */
+  temperature: number
+  /** 配方表上的基准显影秒数（换算前） */
+  baseDevelop: number
+}
+
 /** 运行中：阶段由 deadline 驱动 */
 export interface RunningState {
   status: 'running'
@@ -68,7 +86,16 @@ export interface PersistedState {
   version: 1
   /** 单调版本号，跨标签页用于判定新旧，显式操作时递增 */
   rev: number
+  /**
+   * 现用配方：倒计时、跨阶段、暂停继续、校准全部消费它。
+   * 做过液温修正时，这里的 develop 已是修正后秒数；原始基准见 temperature。
+   */
   recipe: Recipe
+  /**
+   * 温度修正来源。仅当启动时填写了液温才存在；缺省（旧本地记录）意味着
+   * recipe 就是未修正的原配方。停显/定影不参与换算。
+   */
+  temperature?: TemperatureInfo
   timer: TimerState
   /** 最近一次见到的墙钟时间（启动/暂停/恢复/每次 tick 都会刷新） */
   lastWallClock: number
@@ -103,11 +130,46 @@ export function parseDurationSeconds(raw: string): number | null {
   return n
 }
 
-export function validateRecipe(input: RecipeInput): {
+/**
+ * 液温偏离 20℃ 时的显影秒数换算：
+ *   修正秒数 = 基准秒数 × 2^((20 − 液温) / 6)
+ * 结果四舍五入到整数秒。调用前必须已通过 parseTemperature 校验。
+ */
+export function adjustDevelopSeconds(baseDevelopSeconds: number, temperature: number): number {
+  return Math.round(baseDevelopSeconds * 2 ** ((TEMP_BASELINE - temperature) / 6))
+}
+
+/**
+ * 校验可选液温：留空（null，表示不修正）合法；否则须为数值、落在 18–24℃
+ * 且以 0.5℃ 递增。返回数值或错误原因。
+ */
+export function parseTemperature(raw: string): { ok: true; value: number | null } | { ok: false; error: string } {
+  const t = raw.trim()
+  if (t === '') return { ok: true, value: null }
+  if (!/^-?\d+(?:\.\d+)?$/.test(t)) return { ok: false, error: '请输入 18–24 之间的数值（可带 0.5）' }
+  const n = Number(t)
+  if (!Number.isFinite(n)) return { ok: false, error: '请输入 18–24 之间的数值（可带 0.5）' }
+  if (n < TEMP_MIN || n > TEMP_MAX) return { ok: false, error: '液温需在 18–24℃ 之间' }
+  if (Math.abs(n / TEMP_STEP - Math.round(n / TEMP_STEP)) > 1e-9) {
+    return { ok: false, error: '液温需以 0.5℃ 递增' }
+  }
+  return { ok: true, value: n }
+}
+
+export interface ValidatedRecipe {
   valid: boolean
   errors: Record<StageId, string | null>
+  temperatureError: string | null
   recipe: Recipe | null
-} {
+  /** 留空或 20℃ 时为 null，表示未做温度修正 */
+  temperature: number | null
+  /** 基准显影秒数；未填温度时与 recipe.develop 相同 */
+  baseDevelop: number | null
+  /** 修正后的显影秒数；未填温度时为 null（界面直接展示基准三段秒数） */
+  adjustedDevelop: number | null
+}
+
+export function validateRecipe(input: RecipeInput, tempRaw = ''): ValidatedRecipe {
   const errors = { develop: null, stop: null, fix: null } as Record<StageId, string | null>
   const values = {} as Recipe
   let valid = true
@@ -120,19 +182,74 @@ export function validateRecipe(input: RecipeInput): {
       values[stage] = n
     }
   }
-  return { valid, errors, recipe: valid ? values : null }
+
+  let temperatureError: string | null = null
+  let temperature: number | null = null
+  let baseDevelop: number | null = null
+  let adjustedDevelop: number | null = null
+
+  const temp = parseTemperature(tempRaw)
+  if (!temp.ok) {
+    temperatureError = temp.error
+    valid = false
+  } else if (temp.value !== null) {
+    temperature = temp.value
+    if (errors.develop === null) {
+      // 仅在显影基准秒本身合法时才换算，避免 NaN 干扰
+      baseDevelop = values.develop
+      adjustedDevelop = adjustDevelopSeconds(values.develop, temperature)
+      if (adjustedDevelop < 1 || adjustedDevelop > 1800) {
+        temperatureError = `温度修正后的显影时长为 ${adjustedDevelop} 秒，超出 1–1800 秒范围`
+        valid = false
+      }
+    } else {
+      valid = false
+    }
+  }
+
+  if (valid) {
+    if (temperature !== null) {
+      // 现用配方：仅显影被替换为修正值，停显/定影保持原值
+      values.develop = adjustedDevelop as number
+    }
+  }
+
+  return {
+    valid,
+    errors,
+    temperatureError,
+    recipe: valid ? values : null,
+    temperature,
+    baseDevelop,
+    adjustedDevelop,
+  }
 }
 
 export function initialInput(): RecipeInput {
   return { develop: '60', stop: '30', fix: '300' }
 }
 
-/** 启动：从显影开始，记录绝对截止时间；rev 在调用方基于当前存储递增 */
-export function startTimer(recipe: Recipe, now: number, rev: number): PersistedState {
+/** 新会话默认不填液温（留空即按基准三段秒数直接启动） */
+export function initialTemperature(): string {
+  return ''
+}
+
+/**
+ * 启动：从显影开始，记录绝对截止时间；rev 在调用方基于当前存储递增。
+ * 传入的 recipe 必须是「现用配方」（液温修正后仅 develop 被替换）；
+ * temperature 为修正来源（液温 + 基准显影秒），未修正时省略。
+ */
+export function startTimer(
+  recipe: Recipe,
+  now: number,
+  rev: number,
+  temperature?: TemperatureInfo,
+): PersistedState {
   return {
     version: 1,
     rev,
     recipe,
+    ...(temperature ? { temperature } : {}),
     timer: { status: 'running', stage: 'develop', deadline: now + recipe.develop * 1000 },
     lastWallClock: now,
   }
@@ -312,6 +429,22 @@ function reviveTimer(v: unknown): TimerState | null {
   }
 }
 
+/**
+ * 恢复温度修正来源：字段整体缺省（旧本地记录）合法地解释为「未修正配方」。
+ * 一旦出现 temperature 字段，其形状必须完整且取值合法，否则整条记录拒绝。
+ */
+function reviveTemperature(v: unknown): TemperatureInfo | null {
+  if (v === undefined || v === null) return null // 无字段：未修正
+  if (typeof v !== 'object') return null
+  const t = v as Record<string, unknown>
+  const { temperature, baseDevelop } = t
+  if (typeof temperature !== 'number' || !Number.isFinite(temperature)) return null
+  if (temperature < TEMP_MIN || temperature > TEMP_MAX) return null
+  if (Math.abs(temperature / TEMP_STEP - Math.round(temperature / TEMP_STEP)) > 1e-9) return null
+  if (!isFiniteInteger(baseDevelop) || baseDevelop < 1) return null
+  return { temperature, baseDevelop }
+}
+
 function revive(raw: string): StoredRecord | null {
   let parsed: unknown
   try {
@@ -329,7 +462,21 @@ function revive(raw: string): StoredRecord | null {
   const recipe = reviveRecipe(r.recipe)
   const timer = reviveTimer(r.timer)
   if (!recipe || !timer || !isFiniteInteger(r.lastWallClock)) return null
-  return { version: 1, rev: r.rev, recipe, timer, lastWallClock: r.lastWallClock }
+
+  // temperature 缺省 = 未修正旧记录；存在但非法 = 损坏，整体拒绝
+  if (!('temperature' in r)) {
+    return { version: 1, rev: r.rev, recipe, timer, lastWallClock: r.lastWallClock }
+  }
+  const temperature = reviveTemperature(r.temperature)
+  if (!temperature) return null
+  return {
+    version: 1,
+    rev: r.rev,
+    recipe,
+    temperature,
+    timer,
+    lastWallClock: r.lastWallClock,
+  }
 }
 
 export function loadRecord(): StoredRecord | null {

@@ -40,6 +40,30 @@ function StageStepper({ currentIndex }: { currentIndex: number }) {
   )
 }
 
+/**
+ * 本轮温度修正来源：
+ *  - 含 temperature：标明液温、基准显影秒数与现用（修正后）秒数
+ *  - 不含 temperature（含启动时留空、以及旧版本写入的本地记录）：明确解释为未修正配方
+ */
+function TemperatureSource({ state }: { state: PersistedState }) {
+  const info = state.temperature
+  if (!info) {
+    return (
+      <p className="temp-source temp-source-none" data-testid="temp-source" data-corrected="false">
+        本轮按基准配方原时长计时，未做液温修正。
+      </p>
+    )
+  }
+  const { temperature, baseDevelop } = info
+  const activeDevelop = state.recipe.develop
+  return (
+    <p className="temp-source temp-source-on" data-testid="temp-source" data-corrected="true">
+      本轮液温 <strong>{temperature}℃</strong>：显影基准 {baseDevelop} 秒 → 现用{' '}
+      <strong>{activeDevelop}</strong> 秒；停显/定影未换算。
+    </p>
+  )
+}
+
 export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onReset }: Props) {
   const timer = state.timer
   const [calibrateInput, setCalibrateInput] = useState('')
@@ -104,6 +128,8 @@ export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onReset
       aria-live="polite"
     >
       <StageStepper currentIndex={stageIndex} />
+
+      <TemperatureSource state={state} />
 
       <p className="current-stage">
         当前阶段：<strong data-testid="current-stage">{STAGE_LABELS[timer.stage]}</strong>

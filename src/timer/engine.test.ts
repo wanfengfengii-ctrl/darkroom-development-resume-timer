@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   STAGE_IDS,
   STORAGE_KEY,
+  adjustDevelopSeconds,
   advance,
   calibrateTimer,
   commitRecord,
   isPersistedState,
   loadRecord,
+  parseTemperature,
   pauseTimer,
   pausedRemainingSeconds,
   recordRev,
@@ -19,6 +21,7 @@ import {
   withRev,
   type PersistedState,
   type Recipe,
+  type RecipeInput,
 } from './engine'
 
 const recipe: Recipe = { develop: 60, stop: 30, fix: 300 }
@@ -72,6 +75,230 @@ describe('validateRecipe', () => {
     expect(r.valid).toBe(false)
     expect(r.errors.stop).not.toBeNull()
     expect(r.errors.develop).toBeNull()
+  })
+})
+
+describe('液温换算 adjustDevelopSeconds', () => {
+  it('基准温度 20℃ 时修正值等于原值', () => {
+    expect(adjustDevelopSeconds(60, 20)).toBe(60)
+    expect(adjustDevelopSeconds(1, 20)).toBe(1)
+    expect(adjustDevelopSeconds(1800, 20)).toBe(1800)
+  })
+
+  it('18℃ 按 2^((20-18)/6) 延长并四舍五入', () => {
+    // 60 * 2^(2/6) ≈ 75.6 → 76
+    expect(adjustDevelopSeconds(60, 18)).toBe(76)
+    // 8 * 2^(2/6) ≈ 10.08 → 10
+    expect(adjustDevelopSeconds(8, 18)).toBe(10)
+  })
+
+  it('24℃ 按 2^((20-24)/6) 缩短并四舍五入', () => {
+    // 60 * 2^(-4/6) ≈ 37.8 → 38
+    expect(adjustDevelopSeconds(60, 24)).toBe(38)
+    // 1 * 0.63 ≈ 0.63 → 1（不会缩到 0）
+    expect(adjustDevelopSeconds(1, 24)).toBe(1)
+  })
+
+  it('各固定温度档位的整数秒', () => {
+    expect(adjustDevelopSeconds(60, 19)).toBe(67)
+    expect(adjustDevelopSeconds(60, 21)).toBe(53)
+    expect(adjustDevelopSeconds(60, 22)).toBe(48)
+    expect(adjustDevelopSeconds(60, 23)).toBe(42)
+  })
+
+  it('接受 0.5℃ 档位', () => {
+    // 19.5℃：60 * 2^(0.5/6) ≈ 63.6 → 64
+    expect(adjustDevelopSeconds(60, 19.5)).toBe(64)
+    expect(adjustDevelopSeconds(60, 22.5)).toBe(45)
+  })
+})
+
+describe('parseTemperature', () => {
+  it('留空解析为 null（不修正）', () => {
+    expect(parseTemperature('')).toEqual({ ok: true, value: null })
+    expect(parseTemperature('   ')).toEqual({ ok: true, value: null })
+  })
+
+  it.each([
+    ['18', 18],
+    ['24', 24],
+    ['20', 20],
+    ['20.0', 20],
+    ['19.5', 19.5],
+    [' 21.5 ', 21.5],
+  ])('接受合法液温 %s', (raw, value) => {
+    expect(parseTemperature(raw)).toEqual({ ok: true, value })
+  })
+
+  it.each([
+    ['17.9', '越下界'],
+    ['24.1', '越上界'],
+    ['17', '低于 18'],
+    ['25', '高于 24'],
+    ['18.2', '非 0.5 递增'],
+    ['20.25', '0.25 档位'],
+    ['abc', '非数字'],
+    ['20℃', '带单位'],
+  ])('拒绝非法液温 %s（%s）', (raw, _name) => {
+    const r = parseTemperature(raw)
+    expect(r.ok).toBe(false)
+  })
+})
+
+describe('validateRecipe — 液温修正', () => {
+  const baseInput: RecipeInput = { develop: '60', stop: '30', fix: '300' }
+
+  it('液温留空：现用配方即原三段秒数，无修正来源', () => {
+    const r = validateRecipe(baseInput, '')
+    expect(r.valid).toBe(true)
+    expect(r.recipe).toEqual({ develop: 60, stop: 30, fix: 300 })
+    expect(r.temperature).toBeNull()
+    expect(r.adjustedDevelop).toBeNull()
+    expect(r.temperatureError).toBeNull()
+  })
+
+  it('20℃：现用配方显影保持 60，停显/定影不变', () => {
+    const r = validateRecipe(baseInput, '20')
+    expect(r.valid).toBe(true)
+    expect(r.temperature).toBe(20)
+    expect(r.baseDevelop).toBe(60)
+    expect(r.adjustedDevelop).toBe(60)
+    expect(r.recipe).toEqual({ develop: 60, stop: 30, fix: 300 })
+  })
+
+  it('18℃：仅显影替换为修正值 76，停显/定影保持原值', () => {
+    const r = validateRecipe(baseInput, '18')
+    expect(r.valid).toBe(true)
+    expect(r.temperature).toBe(18)
+    expect(r.baseDevelop).toBe(60)
+    expect(r.adjustedDevelop).toBe(76)
+    expect(r.recipe).toEqual({ develop: 76, stop: 30, fix: 300 })
+  })
+
+  it('24℃：显影缩短为 38', () => {
+    const r = validateRecipe(baseInput, '24')
+    expect(r.valid).toBe(true)
+    expect(r.recipe?.develop).toBe(38)
+    expect(r.recipe?.stop).toBe(30)
+    expect(r.recipe?.fix).toBe(300)
+  })
+
+  it('液温格式非法时整体非法并给出温度错误，阻止创建会话', () => {
+    const r = validateRecipe(baseInput, '20.3')
+    expect(r.valid).toBe(false)
+    expect(r.recipe).toBeNull()
+    expect(r.temperatureError).not.toBeNull()
+  })
+
+  it('液温越界（17℃）拒绝', () => {
+    const r = validateRecipe(baseInput, '17')
+    expect(r.valid).toBe(false)
+    expect(r.temperatureError).toContain('18–24')
+    expect(r.recipe).toBeNull()
+  })
+
+  it('修正结果超过 1800 秒（1800 秒基准 @18℃ → 2268）拒绝并说明', () => {
+    const r = validateRecipe({ develop: '1800', stop: '30', fix: '300' }, '18')
+    expect(r.valid).toBe(false)
+    expect(r.adjustedDevelop).toBe(2268)
+    expect(r.temperatureError).toContain('2268')
+    expect(r.recipe).toBeNull()
+  })
+
+  it('修正结果不会低于 1 秒（1 秒基准 @24℃ → 1）仍合法', () => {
+    const r = validateRecipe({ develop: '1', stop: '1', fix: '1' }, '24')
+    expect(r.valid).toBe(true)
+    expect(r.recipe?.develop).toBe(1)
+  })
+
+  it('显影基准本身非法时不因换算报错而掩盖，且仍整体非法', () => {
+    const r = validateRecipe({ develop: 'x', stop: '30', fix: '300' }, '18')
+    expect(r.valid).toBe(false)
+    expect(r.errors.develop).not.toBeNull()
+    expect(r.recipe).toBeNull()
+  })
+
+  it('液温非法与阶段秒非法可以同时出现', () => {
+    const r = validateRecipe({ develop: '60', stop: '0', fix: '300' }, '30')
+    expect(r.valid).toBe(false)
+    expect(r.errors.stop).not.toBeNull()
+    expect(r.temperatureError).not.toBeNull()
+  })
+})
+
+describe('startTimer / 持久化 — 温度修正来源', () => {
+  it('带修正启动：现用配方 develop 为修正值，并持久化温度与基准秒', () => {
+    const active: Recipe = { develop: 76, stop: 30, fix: 300 }
+    const s = startTimer(active, T0, 1, { temperature: 18, baseDevelop: 60 })
+    expect(s.recipe).toEqual(active)
+    expect(s.temperature).toEqual({ temperature: 18, baseDevelop: 60 })
+    // deadline 消费的是修正后秒数
+    expect(s.timer).toEqual({ status: 'running', stage: 'develop', deadline: T0 + 76 * SECOND })
+  })
+
+  it('未修正启动不写 temperature 字段', () => {
+    const s = startTimer(recipe, T0, 1)
+    expect(s.temperature).toBeUndefined()
+    expect('temperature' in s).toBe(false)
+  })
+
+  it('含温度的记录保存后可完整恢复', () => {
+    const s = startTimer({ develop: 76, stop: 30, fix: 300 }, T0, 1, {
+      temperature: 18,
+      baseDevelop: 60,
+    })
+    saveRecord(s)
+    const loaded = loadRecord()
+    expect(loaded).toEqual(s)
+    if (loaded && isPersistedState(loaded)) {
+      expect(loaded.temperature).toEqual({ temperature: 18, baseDevelop: 60 })
+      expect(loaded.recipe.develop).toBe(76)
+    }
+  })
+
+  it('旧本地记录（无 temperature 字段）恢复为未修正配方，时间线照常推进', () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        rev: 1,
+        recipe: { develop: 60, stop: 30, fix: 300 },
+        timer: { status: 'running', stage: 'develop', deadline: T0 + 60 * SECOND },
+        lastWallClock: T0,
+      }),
+    )
+    const loaded = loadRecord()
+    expect(loaded).not.toBeNull()
+    expect(loaded && isPersistedState(loaded)).toBe(true)
+    if (loaded && isPersistedState(loaded)) {
+      expect(loaded.temperature).toBeUndefined()
+      expect(loaded.recipe).toEqual(recipe)
+      // 恢复后按原显影 60 秒计时
+      const next = advance(loaded, T0 + 60 * SECOND)
+      expect(next.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 90 * SECOND })
+    }
+  })
+
+  it.each([
+    [{ temperature: 17, baseDevelop: 60 }, '液温越界'],
+    [{ temperature: 24.5, baseDevelop: 60 }, '液温越上界'],
+    [{ temperature: 20.2, baseDevelop: 60 }, '非 0.5 档位'],
+    [{ temperature: '18', baseDevelop: 60 }, '液温非数字'],
+    [{ temperature: 18, baseDevelop: 0 }, '基准秒为 0'],
+    [{ temperature: 18 }, '缺少基准秒'],
+  ])('temperature 形状非法（%s）的记录整体拒绝恢复', (tempInfo, _name) => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        rev: 1,
+        recipe: { develop: 76, stop: 30, fix: 300 },
+        temperature: tempInfo,
+        timer: { status: 'running', stage: 'develop', deadline: T0 + 76 * SECOND },
+        lastWallClock: T0,
+      }),
+    )
+    expect(loadRecord()).toBeNull()
   })
 })
 

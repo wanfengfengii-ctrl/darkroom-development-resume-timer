@@ -25,6 +25,14 @@ async function startRecipe(page: Page, d: string, s: string, f: string): Promise
   await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
 }
 
+async function setTemperature(page: Page, temp: string): Promise<void> {
+  await page.getByTestId('temperature-input').fill(temp)
+}
+
+async function readSeconds(page: Page): Promise<number> {
+  return Number((await page.getByTestId('seconds').textContent())!.trim())
+}
+
 test.describe('配方校验', () => {
   test('任一非法值都禁止启动，全部合法才可启动', async ({ page }) => {
     await page.goto('/')
@@ -49,6 +57,129 @@ test.describe('配方校验', () => {
     await expect(start).toBeEnabled()
     await start.click()
     await expect(page.getByTestId('current-stage')).toHaveText('显影')
+  })
+})
+
+test.describe('液温修正', () => {
+  test('表单即时展示显影原值与修正值，停显/定影不参与换算', async ({ page }) => {
+    await page.goto('/')
+    await page.locator('#input-develop').fill('60')
+    await page.locator('#input-stop').fill('30')
+    await page.locator('#input-fix').fill('300')
+
+    // 18℃：60 → 76
+    await setTemperature(page, '18')
+    await expect(page.getByTestId('temp-preview')).toContainText('60')
+    await expect(page.getByTestId('temp-preview')).toContainText('76')
+
+    // 24℃：60 → 38
+    await setTemperature(page, '24')
+    await expect(page.getByTestId('temp-preview')).toContainText('38')
+
+    // 20℃ 为基准：保持 60
+    await setTemperature(page, '20')
+    await expect(page.getByTestId('temp-preview')).toContainText('保持 60 秒')
+
+    // 留空：修正预览消失，可直接按原时长启动
+    await setTemperature(page, '')
+    await expect(page.getByTestId('temp-preview')).toHaveCount(0)
+    await expect(page.getByTestId('start-button')).toBeEnabled()
+  })
+
+  test('20℃ 启动保持原显影时长，面板标明本轮温度来源', async ({ page }) => {
+    await page.goto('/')
+    await fillRecipe(page, '60', '30', '300')
+    await setTemperature(page, '20')
+    await page.getByTestId('start-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 20℃ 不改变时长：首屏剩余仍为 60 秒（容差 1 秒给启动耗时）
+    expect(await readSeconds(page)).toBeGreaterThan(59)
+    expect(await readSeconds(page)).toBeLessThanOrEqual(60)
+
+    const source = page.getByTestId('temp-source')
+    await expect(source).toHaveAttribute('data-corrected', 'true')
+    await expect(source).toContainText('20℃')
+    await expect(source).toContainText('60')
+  })
+
+  test('18℃ 启动后刷新仍显示并使用修正后的显影时长', async ({ page }) => {
+    await page.goto('/')
+    await fillRecipe(page, '60', '30', '300')
+    await setTemperature(page, '18')
+    await page.getByTestId('start-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 60 @18℃ → 76
+    expect(await readSeconds(page)).toBeGreaterThan(75)
+    expect(await readSeconds(page)).toBeLessThanOrEqual(76)
+    const source = page.getByTestId('temp-source')
+    await expect(source).toHaveAttribute('data-corrected', 'true')
+    await expect(source).toContainText('18℃')
+    await expect(source).toContainText('基准 60')
+    await expect(source).toContainText('76')
+
+    // 倒计时确实在走
+    const before = await readSeconds(page)
+    await page.waitForTimeout(1_200)
+    const after = await readSeconds(page)
+    expect(after).toBeLessThan(before)
+
+    // 刷新后仍按修正值（约 74–75）计时，且面板仍标明 18℃ 修正来源
+    await page.reload()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    expect(await readSeconds(page)).toBeGreaterThan(70)
+    expect(await readSeconds(page)).toBeLessThanOrEqual(76)
+    await expect(page.getByTestId('temp-source')).toContainText('18℃')
+
+    // 本地记录里确实写入了温度来源与基准显影秒
+    const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.temperature).toEqual({ temperature: 18, baseDevelop: 60 })
+    expect(stored.recipe.develop).toBe(76)
+    expect(stored.recipe.stop).toBe(30)
+    expect(stored.recipe.fix).toBe(300)
+  })
+
+  test('非法液温（格式/越界/非 0.5 递增/修正越界）无法开始冲洗并说明原因', async ({ page }) => {
+    await page.goto('/')
+    await fillRecipe(page, '60', '30', '300')
+    const start = page.getByTestId('start-button')
+    const error = page.getByTestId('temperature-error')
+
+    for (const bad of ['abc', '17', '25', '20.25', '18.2']) {
+      await setTemperature(page, bad)
+      await expect(start).toBeDisabled()
+      await expect(error).toBeVisible()
+    }
+
+    // 修正结果超出 1800 秒：基准 1800 @18℃ → 2268
+    await page.locator('#input-develop').fill('1800')
+    await setTemperature(page, '18')
+    await expect(start).toBeDisabled()
+    await expect(error).toContainText('2268')
+
+    // 清空液温后恢复可启动
+    await setTemperature(page, '')
+    await expect(start).toBeEnabled()
+  })
+
+  test('无温度信息的旧本地记录恢复为未修正配方，面板明确解释', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 60_000 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    const source = page.getByTestId('temp-source')
+    await expect(source).toHaveAttribute('data-corrected', 'false')
+    await expect(source).toContainText('未做液温修正')
+    expect(await readSeconds(page)).toBeGreaterThan(59)
   })
 })
 
