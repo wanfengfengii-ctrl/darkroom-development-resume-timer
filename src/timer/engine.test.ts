@@ -3,6 +3,7 @@ import {
   STAGE_IDS,
   STORAGE_KEY,
   advance,
+  calibrateTimer,
   commitRecord,
   isPersistedState,
   loadRecord,
@@ -182,6 +183,114 @@ describe('暂停 / 继续', () => {
     const s = runningAt(0, T0, T0 + 60 * SECOND)
     const next = resumeTimer(s, T0 + 61 * SECOND)
     if (next.timer.status === 'running') expect(next.timer.stage).toBe('stop')
+  })
+})
+
+describe('校准剩余时间', () => {
+  it('运行态：以当前墙钟重建绝对截止时间，阶段保持不变', () => {
+    // 停显进行中，截止 T0+20s；在 T0+5s 校准为 90 秒
+    const s = runningAt(1, T0, T0 + 20 * SECOND)
+    const calibrated = calibrateTimer(s, 90, T0 + 5 * SECOND)
+    expect(calibrated.timer).toEqual({
+      status: 'running',
+      stage: 'stop',
+      deadline: T0 + 5 * SECOND + 90 * SECOND,
+    })
+    expect(calibrated.lastWallClock).toBe(T0 + 5 * SECOND)
+    if (calibrated.timer.status === 'running') {
+      expect(remainingSecondsAt(calibrated.timer, T0 + 5 * SECOND)).toBe(90)
+    }
+  })
+
+  it('运行态：校准可延长也可缩短剩余时间', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    const longer = calibrateTimer(s, 1800, T0 + 10 * SECOND)
+    if (longer.timer.status === 'running') {
+      expect(longer.timer.deadline).toBe(T0 + 10 * SECOND + 1800 * SECOND)
+    }
+    const shorter = calibrateTimer(s, 1, T0 + 10 * SECOND)
+    if (shorter.timer.status === 'running') {
+      expect(shorter.timer.deadline).toBe(T0 + 10 * SECOND + 1 * SECOND)
+    }
+  })
+
+  it('暂停态：替换已保存的剩余毫秒，阶段保持不变', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    const paused = pauseTimer(s, T0 + 20 * SECOND) // 显影剩 40s
+    const calibrated = calibrateTimer(paused, 120, T0 + 30 * SECOND)
+    expect(calibrated.timer).toEqual({
+      status: 'paused',
+      stage: 'develop',
+      remainingMs: 120 * SECOND,
+    })
+    expect(calibrated.lastWallClock).toBe(T0 + 30 * SECOND)
+    // 校准后再继续：按新剩余值重建截止时间
+    const resumed = resumeTimer(calibrated, T0 + 400 * SECOND)
+    if (resumed.timer.status === 'running') {
+      expect(resumed.timer.stage).toBe('develop')
+      expect(resumed.timer.deadline).toBe(T0 + 400 * SECOND + 120 * SECOND)
+    }
+  })
+
+  it('校准以更高 rev 提交后，旧标签页的陈旧 running tick 不能覆盖这次修改', () => {
+    // 标签 A：运行中 rev=1
+    const running = startTimer(recipe, T0, 1)
+    expect(commitRecord(running)).toEqual(running)
+
+    // 标签 B：校准剩余时间为 300 秒，rev 提升到 2 并提交
+    const calibrated = withRev(calibrateTimer(running, 300, T0 + 10 * SECOND), 2)
+    expect(commitRecord(calibrated)).toEqual(calibrated)
+
+    // 标签 A 的定时器稍后才醒来，拿着旧 rev=1 的推进试图写回
+    const staleTick = advance(running, T0 + 11 * SECOND)
+    const result = commitRecord(staleTick)
+
+    // 存储必须仍是校准后的记录，陈旧推进被拒绝
+    const stored = loadRecord()
+    expect(stored).toEqual(calibrated)
+    expect(result).toEqual(calibrated)
+    if (stored && isPersistedState(stored) && stored.timer.status === 'running') {
+      expect(stored.timer.deadline).toBe(T0 + 10 * SECOND + 300 * SECOND)
+    }
+  })
+
+  it('暂停态校准以更高 rev 提交后，陈旧 tick 同样无法覆盖', () => {
+    const running = startTimer(recipe, T0, 1)
+    commitRecord(running)
+    const paused = withRev(pauseTimer(running, T0 + 20 * SECOND), 2)
+    commitRecord(paused)
+
+    // 暂停中校准为 90 秒，rev 提升到 3
+    const calibrated = withRev(calibrateTimer(paused, 90, T0 + 25 * SECOND), 3)
+    expect(commitRecord(calibrated)).toEqual(calibrated)
+
+    // 旧标签拿着 rev=1 的 running 推进写回，被拒
+    expect(commitRecord(advance(running, T0 + 26 * SECOND))).toEqual(calibrated)
+    const stored = loadRecord()
+    if (stored && isPersistedState(stored) && stored.timer.status === 'paused') {
+      expect(stored.timer.remainingMs).toBe(90 * SECOND)
+    } else {
+      expect.unreachable('存储应保持暂停态校准结果')
+    }
+  })
+
+  it('完成态与锁定态不接受校准', () => {
+    const done: PersistedState = { ...runningAt(2, T0, T0), timer: { status: 'done' } }
+    expect(calibrateTimer(done, 60, T0 + 1000)).toEqual(done)
+
+    const locked = advance(runningAt(0, T0, T0 + 60 * SECOND), T0 - 1000)
+    expect(locked.timer.status).toBe('locked')
+    expect(calibrateTimer(locked, 60, T0 + 500 * SECOND)).toEqual(locked)
+  })
+
+  it('时钟回拨时校准转为锁定，而不是重建计时', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    s.lastWallClock = T0 + 100 * SECOND
+    const result = calibrateTimer(s, 60, T0 + 50 * SECOND)
+    expect(result.timer.status).toBe('locked')
+    if (result.timer.status === 'locked') {
+      expect(result.timer.observedAt).toBe(T0 + 50 * SECOND)
+    }
   })
 })
 

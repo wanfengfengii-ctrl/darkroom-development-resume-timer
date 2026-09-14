@@ -10,9 +10,9 @@
  * 因此刷新页面或平板息屏后，已过去的阶段绝不会被重走。
  *
  * 多标签页：同一冲洗可能在多个标签页打开。每条持久化记录带单调递增的
- * rev；显式操作（开始/暂停/继续/重置）提升 rev，各标签页通过 storage
+ * rev；显式操作（开始/暂停/继续/校准/重置）提升 rev，各标签页通过 storage
  * 事件同步。低 rev 的陈旧写入（例如另一个仍在运行的标签页的定时 tick）
- * 不能覆盖高 rev 的暂停记录。重置写一条高 rev 的墓碑，防止旧标签页把
+ * 不能覆盖高 rev 的暂停/校准记录。重置写一条高 rev 的墓碑，防止旧标签页把
  * 已放弃的会话「复活」。
  */
 
@@ -216,6 +216,38 @@ export function resumeTimer(state: PersistedState, now: number): PersistedState 
     deadline: now + state.timer.remainingMs,
   }
   return advance({ ...checked, timer: running }, now)
+}
+
+/**
+ * 校准剩余时间：把当前阶段的剩余时间改为指定秒数（1–1800，由调用方校验）。
+ *  - 运行态：以当前墙钟重建绝对截止时间 deadline = now + seconds
+ *  - 暂停态：替换已保存的剩余毫秒 remainingMs = seconds
+ * 两种情况阶段都保持不变；完成/锁定态不接受校准。
+ * 与暂停/继续一致，时钟回拨优先于校准：回拨时改为锁定。
+ */
+export function calibrateTimer(state: PersistedState, seconds: number, now: number): PersistedState {
+  if (now < state.lastWallClock) {
+    return {
+      ...state,
+      timer: { status: 'locked', lastWallClock: state.lastWallClock, observedAt: now },
+    }
+  }
+  const timer = state.timer
+  if (timer.status === 'running') {
+    return {
+      ...state,
+      timer: { status: 'running', stage: timer.stage, deadline: now + seconds * 1000 },
+      lastWallClock: now,
+    }
+  }
+  if (timer.status === 'paused') {
+    return {
+      ...state,
+      timer: { status: 'paused', stage: timer.stage, remainingMs: seconds * 1000 },
+      lastWallClock: now,
+    }
+  }
+  return state
 }
 
 /** 剩余整秒数（向上取整）；非运行态返回 null */

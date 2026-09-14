@@ -3,7 +3,7 @@ import { TimerPanel } from './components/TimerPanel'
 import { useTimer } from './timer/useTimer'
 
 export default function App() {
-  const { state, now, start, pause, resume, reset } = useTimer()
+  const { state, now, start, pause, resume, calibrate, reset } = useTimer()
 
   return (
     <main className="app">
@@ -15,7 +15,14 @@ export default function App() {
       {state === null ? (
         <RecipeForm onStart={start} />
       ) : (
-        <TimerPanel state={state} now={now} onPause={pause} onResume={resume} onReset={reset} />
+        <TimerPanel
+          state={state}
+          now={now}
+          onPause={pause}
+          onResume={resume}
+          onCalibrate={calibrate}
+          onReset={reset}
+        />
       )}
     </main>
   )

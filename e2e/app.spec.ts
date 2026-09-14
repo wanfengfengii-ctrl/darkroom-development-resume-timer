@@ -187,6 +187,109 @@ test.describe('暂停 / 继续', () => {
   })
 })
 
+test.describe('校准剩余时间', () => {
+  test('运行中校准后，刷新仍按新时间倒数', async ({ page }) => {
+    await page.goto('/')
+    await startRecipe(page, '60', '60', '60')
+
+    // 运行中把显影剩余校准为 100 秒：阶段不变，立即按新值倒数
+    await page.getByTestId('calibrate-input').fill('100')
+    await page.getByTestId('calibrate-button').click()
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    await expect(page.getByTestId('seconds')).toHaveText('100')
+
+    // 刷新后仍按校准后的时间倒数（绝不会回到配方原来的 60 秒）
+    await page.reload()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    await expect
+      .poll(async () => Number((await page.getByTestId('seconds').textContent())!.trim()))
+      .toBeGreaterThan(90)
+
+    // 且倒数确实在继续走
+    const before = Number((await page.getByTestId('seconds').textContent())!.trim())
+    await page.waitForTimeout(1_500)
+    const after = Number((await page.getByTestId('seconds').textContent())!.trim())
+    expect(after).toBeLessThan(before)
+  })
+
+  test('暂停中校准后，刷新仍保持新剩余值，再继续按校准值计时', async ({ page }) => {
+    await page.goto('/')
+    await startRecipe(page, '60', '60', '60')
+    await page.getByTestId('pause-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+
+    // 暂停中校准为 90 秒
+    await page.getByTestId('calibrate-input').fill('90')
+    await page.getByTestId('calibrate-button').click()
+    await expect(page.getByTestId('seconds')).toHaveText('90')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 刷新后仍是暂停，剩余为校准值 90（不流逝）
+    await page.reload()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    await expect(page.getByTestId('seconds')).toHaveText('90')
+    await page.waitForTimeout(1_200)
+    await expect(page.getByTestId('seconds')).toHaveText('90')
+
+    // 继续后从 90 开始正常倒数
+    await page.getByTestId('resume-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('seconds')).toHaveText('90')
+    await expect
+      .poll(async () => Number((await page.getByTestId('seconds').textContent())!.trim()), {
+        timeout: 3_000,
+      })
+      .toBeLessThan(90)
+  })
+
+  test('空、小数、越界或非数字输入就地提示，当前阶段与剩余时间不变', async ({ page }) => {
+    await page.goto('/')
+    await startRecipe(page, '60', '60', '60')
+
+    for (const bad of ['abc', '1.5', '0', '1801', '']) {
+      await page.getByTestId('calibrate-input').fill(bad)
+      await page.getByTestId('calibrate-button').click()
+      // 就地提示，且计时不受影响
+      await expect(page.getByTestId('calibrate-error')).toBeVisible()
+      await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+      await expect(page.getByTestId('current-stage')).toHaveText('显影')
+      const seconds = Number((await page.getByTestId('seconds').textContent())!.trim())
+      expect(seconds).toBeGreaterThan(50)
+      expect(seconds).toBeLessThanOrEqual(60)
+    }
+
+    // 合法输入后错误消失，剩余时间按校准值更新
+    await page.getByTestId('calibrate-input').fill('45')
+    await page.getByTestId('calibrate-button').click()
+    await expect(page.getByTestId('calibrate-error')).toHaveCount(0)
+    await expect(page.getByTestId('seconds')).toHaveText('45')
+  })
+
+  test('完成态与时钟回拨锁定态不显示校准入口', async ({ page }) => {
+    // 完成态
+    await page.goto('/')
+    await startRecipe(page, '1', '1', '1')
+    await expect(page.getByTestId('done-title')).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByTestId('calibrate-input')).toHaveCount(0)
+    await expect(page.getByTestId('calibrate-button')).toHaveCount(0)
+
+    // 锁定态
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 60_000 },
+      lastWallClock: now + 120_000,
+    })
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'locked')
+    await expect(page.getByTestId('calibrate-input')).toHaveCount(0)
+    await expect(page.getByTestId('calibrate-button')).toHaveCount(0)
+  })
+})
+
 test.describe('冲洗完成', () => {
   test('正常走完三阶段显示完成，刷新后仍是完成结果', async ({ page }) => {
     await page.goto('/')

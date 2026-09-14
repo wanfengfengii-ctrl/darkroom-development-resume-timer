@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   advance,
+  calibrateTimer,
   commitRecord,
   isPersistedState,
   loadRecord,
@@ -19,9 +20,9 @@ import {
  * 计时器状态机的 React 绑定，支持同一冲洗在多个标签页同时打开：
  *  - 挂载时从 localStorage 恢复并立即按墙钟推进（跨阶段/完成/回拨锁定）
  *  - 运行中每 200ms 按墙钟推进并以相同 rev 提交；暂停/完成/锁定不产生后台写入
- *  - 显式操作（开始/暂停/继续/重置）把 rev +1 后提交（commit）
- *  - 监听 storage 事件：其它标签页暂停/继续/重置后本页立即跟进
- *  - 提交带 rev 比较：低 rev 的陈旧 running tick 无法覆盖高 rev 的暂停记录；
+ *  - 显式操作（开始/暂停/继续/校准/重置）把 rev +1 后提交（commit）
+ *  - 监听 storage 事件：其它标签页暂停/继续/校准/重置后本页立即跟进
+ *  - 提交带 rev 比较：低 rev 的陈旧 running tick 无法覆盖高 rev 的暂停/校准记录；
  *    重置写高 rev 墓碑，旧标签页不能把会话复活
  *  - 页面重新可见时重新从存储读取并补推进（息屏唤醒、后台标签切回）
  */
@@ -31,6 +32,7 @@ export function useTimer(): {
   start: (recipe: Recipe) => void
   pause: () => void
   resume: () => void
+  calibrate: (seconds: number) => void
   reset: () => void
 } {
   const recordRef = useRef<StoredRecord | null>(null)
@@ -140,6 +142,11 @@ export function useTimer(): {
 
   const pause = useCallback(() => bump(pauseTimer), [bump])
   const resume = useCallback(() => bump(resumeTimer), [bump])
+  /** 校准：显式操作，rev +1 提交；其它标签页经 storage 事件采纳新剩余时间 */
+  const calibrate = useCallback(
+    (seconds: number) => bump((base, now) => calibrateTimer(base, seconds, now)),
+    [bump],
+  )
 
   const reset = useCallback(() => {
     const base = loadRecord() ?? recordRef.current
@@ -149,5 +156,5 @@ export function useTimer(): {
   }, [adopt])
 
   const state = record && isPersistedState(record) ? record : null
-  return { state, now, start, pause, resume, reset }
+  return { state, now, start, pause, resume, calibrate, reset }
 }

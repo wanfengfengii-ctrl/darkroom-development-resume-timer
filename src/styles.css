@@ -318,6 +318,63 @@ form .btn.primary {
   justify-content: center;
 }
 
+/* ---- 校准剩余时间 ---- */
+
+.calibrate {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--line);
+}
+
+.calibrate-label {
+  display: block;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.calibrate-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.calibrate-row input {
+  width: 110px;
+  font-size: 18px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.calibrate-row input:focus {
+  outline: 2px solid var(--amber);
+  outline-offset: 1px;
+}
+
+.calibrate-row input[aria-invalid="true"] {
+  border-color: var(--red);
+  outline-color: var(--red);
+}
+
+.calibrate-row .btn {
+  min-width: auto;
+  padding: 9px 16px;
+  font-size: 15px;
+}
+
+.calibrate .error {
+  display: block;
+  text-align: center;
+  margin: 8px 0 0;
+}
+
 .panel-locked h2,
 .panel-done h2 {
   color: var(--red);

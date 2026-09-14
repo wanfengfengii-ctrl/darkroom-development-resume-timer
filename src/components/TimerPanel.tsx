@@ -1,6 +1,8 @@
+import { useState, type FormEvent } from 'react'
 import {
   STAGE_IDS,
   STAGE_LABELS,
+  parseDurationSeconds,
   pausedRemainingSeconds,
   remainingSecondsAt,
   type PersistedState,
@@ -11,6 +13,7 @@ interface Props {
   now: number
   onPause: () => void
   onResume: () => void
+  onCalibrate: (seconds: number) => void
   onReset: () => void
 }
 
@@ -37,8 +40,23 @@ function StageStepper({ currentIndex }: { currentIndex: number }) {
   )
 }
 
-export function TimerPanel({ state, now, onPause, onResume, onReset }: Props) {
+export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onReset }: Props) {
   const timer = state.timer
+  const [calibrateInput, setCalibrateInput] = useState('')
+  const [calibrateError, setCalibrateError] = useState<string | null>(null)
+
+  /** 校准提交：非法输入就地提示且绝不动计时；合法才走显式操作 */
+  const submitCalibrate = (e: FormEvent) => {
+    e.preventDefault()
+    const seconds = parseDurationSeconds(calibrateInput)
+    if (seconds === null) {
+      setCalibrateError('请输入 1–1800 的整数秒')
+      return
+    }
+    setCalibrateError(null)
+    setCalibrateInput('')
+    onCalibrate(seconds)
+  }
 
   if (timer.status === 'locked') {
     return (
@@ -120,6 +138,38 @@ export function TimerPanel({ state, now, onPause, onResume, onReset }: Props) {
           重置
         </button>
       </div>
+
+      <form className="calibrate" onSubmit={submitCalibrate} aria-label="校准剩余时间">
+        <label className="calibrate-label" htmlFor="calibrate-input">
+          校准剩余时间
+        </label>
+        <div className="calibrate-row">
+          <input
+            id="calibrate-input"
+            type="text"
+            inputMode="numeric"
+            placeholder="1–1800"
+            value={calibrateInput}
+            aria-invalid={calibrateError !== null}
+            aria-describedby="calibrate-error"
+            data-testid="calibrate-input"
+            onChange={(e) => {
+              setCalibrateInput(e.target.value)
+              setCalibrateError(null)
+            }}
+          />
+
+          <span className="unit">秒</span>
+          <button type="submit" className="btn ghost" data-testid="calibrate-button">
+            校准
+          </button>
+        </div>
+        {calibrateError && (
+          <p id="calibrate-error" className="error" role="alert" data-testid="calibrate-error">
+            {calibrateError}
+          </p>
+        )}
+      </form>
 
       {timer.status === 'paused' && (
         <p className="hint">暂停中剩余时间已保存，即使刷新页面仍保持暂停。</p>
