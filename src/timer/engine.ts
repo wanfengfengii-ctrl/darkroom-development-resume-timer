@@ -10,10 +10,10 @@
  * 因此刷新页面或平板息屏后，已过去的阶段绝不会被重走。
  *
  * 多标签页：同一冲洗可能在多个标签页打开。每条持久化记录带单调递增的
- * rev；显式操作（开始/暂停/继续/校准/重置）提升 rev，各标签页通过 storage
- * 事件同步。低 rev 的陈旧写入（例如另一个仍在运行的标签页的定时 tick）
- * 不能覆盖高 rev 的暂停/校准记录。重置写一条高 rev 的墓碑，防止旧标签页把
- * 已放弃的会话「复活」。
+ * rev；显式操作（开始/暂停/继续/校准/确认搅动/结束本阶段/重置）提升 rev，
+ * 各标签页通过 storage 事件同步。低 rev 的陈旧写入（例如另一个仍在运行的
+ * 标签页的定时 tick）不能覆盖高 rev 的暂停/校准记录。重置写一条高 rev 的
+ * 墓碑，防止旧标签页把已放弃的会话「复活」。
  */
 
 export const STAGE_IDS = ['develop', 'stop', 'fix'] as const
@@ -472,6 +472,63 @@ export function calibrateTimer(state: PersistedState, seconds: number, now: numb
     ...advanced,
     timer: { status: 'running', stage: timer.stage, deadline: now + seconds * 1000 },
     lastWallClock: now,
+  }
+}
+
+/** endStageEarly 的结果：state 为应采纳的记录；ended 表示确实提前结束了所携阶段 */
+export interface EndStageResult {
+  state: PersistedState
+  /** false 表示阶段已在另一标签页或计时推进中变化，本次未提前结束 */
+  ended: boolean
+}
+
+/**
+ * 提前结束当前药浴（试片密度已达标或需立即换液）。操作携带点击时面板显示的
+ * 阶段 expectedStage，避免陈旧面板误跳两段：
+ *  1. 先按当前墙钟消费自然到期时间（含回拨锁定）：当前阶段已到期却尚未被
+ *     tick 推进时，自然跨入后续阶段/完成，本次操作不再额外跳段
+ *  2. 推进后阶段仍与 expectedStage 一致：转入下一药浴——运行态以下一阶段
+ *     完整时长倒数（deadline = now + 全量秒数）；暂停态保持暂停并保存完整
+ *     时长。跳过显影时搅动提示一并清除；跳过定影（最后阶段）直接进入完成
+ *  3. 推进后阶段已变化（另一标签页或计时推进先行）：不越过新阶段，返回
+ *     推进结果且 ended=false，由界面采纳较高修订记录并提示
+ *     「阶段已更新，未提前结束」
+ */
+export function endStageEarly(state: PersistedState, expectedStage: StageId, now: number): EndStageResult {
+  const advanced = advance(state, now)
+  const timer = advanced.timer
+  // 完成/锁定态不接受结束操作；阶段已不一致时不越过新阶段
+  if (timer.status !== 'running' && timer.status !== 'paused') {
+    return { state: advanced, ended: false }
+  }
+  if (timer.stage !== expectedStage) {
+    return { state: advanced, ended: false }
+  }
+
+  const nextIndex = STAGE_IDS.indexOf(timer.stage) + 1
+  if (nextIndex >= STAGE_IDS.length) {
+    // 跳过定影（最后阶段）：冲洗完成
+    return {
+      state: { ...advanced, agitation: undefined, timer: { status: 'done' }, lastWallClock: now },
+      ended: true,
+    }
+  }
+
+  const nextStage = STAGE_IDS[nextIndex]
+  const fullMs = advanced.recipe[nextStage] * 1000
+  const nextTimer: TimerState =
+    timer.status === 'running'
+      ? { status: 'running', stage: nextStage, deadline: now + fullMs }
+      : { status: 'paused', stage: nextStage, remainingMs: fullMs }
+  return {
+    state: {
+      ...advanced,
+      // 跳过显影：搅动提示随显影结束一并清除
+      ...(timer.stage === 'develop' ? { agitation: undefined } : {}),
+      timer: nextTimer,
+      lastWallClock: now,
+    },
+    ended: true,
   }
 }
 

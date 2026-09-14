@@ -3,7 +3,7 @@ import { TimerPanel } from './components/TimerPanel'
 import { useTimer } from './timer/useTimer'
 
 export default function App() {
-  const { state, now, start, pause, resume, calibrate, acknowledge, reset } = useTimer()
+  const { state, now, start, pause, resume, calibrate, acknowledge, endStage, reset } = useTimer()
 
   return (
     <main className="app">
@@ -22,6 +22,7 @@ export default function App() {
           onResume={resume}
           onCalibrate={calibrate}
           onAcknowledge={acknowledge}
+          onEndStage={endStage}
           onReset={reset}
         />
       )}

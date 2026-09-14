@@ -7,6 +7,7 @@ import {
   pausedRemainingSeconds,
   remainingSecondsAt,
   type PersistedState,
+  type StageId,
 } from '../timer/engine'
 
 interface Props {
@@ -16,6 +17,8 @@ interface Props {
   onResume: () => void
   onCalibrate: (seconds: number) => void
   onAcknowledge: () => void
+  /** 提前结束当前药浴；返回 false 表示阶段已在别处变化、本次未提前结束 */
+  onEndStage: (expectedStage: StageId) => boolean
   onReset: () => void
 }
 
@@ -106,10 +109,11 @@ function TemperatureSource({ state }: { state: PersistedState }) {
   )
 }
 
-export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onAcknowledge, onReset }: Props) {
+export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onAcknowledge, onEndStage, onReset }: Props) {
   const timer = state.timer
   const [calibrateInput, setCalibrateInput] = useState('')
   const [calibrateError, setCalibrateError] = useState<string | null>(null)
+  const [endStageNotice, setEndStageNotice] = useState<string | null>(null)
 
   /** 校准提交：非法输入就地提示且绝不动计时；合法才走显式操作 */
   const submitCalibrate = (e: FormEvent) => {
@@ -122,6 +126,18 @@ export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onAckno
     setCalibrateError(null)
     setCalibrateInput('')
     onCalibrate(seconds)
+  }
+
+  /**
+   * 结束本阶段：操作携带点击时面板显示的阶段。若阶段已在另一标签页或计时
+   * 推进中变化，状态机不会越过新阶段，就地提示「阶段已更新，未提前结束」，
+   * 避免陈旧面板误跳两段；成功转入下一药浴时清除提示。
+   */
+  const handleEndStage = () => {
+    const current = state.timer
+    if (current.status !== 'running' && current.status !== 'paused') return
+    const ended = onEndStage(current.stage)
+    setEndStageNotice(ended ? null : '阶段已更新，未提前结束')
   }
 
   if (timer.status === 'locked') {
@@ -202,6 +218,15 @@ export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onAckno
         )}
         <button
           type="button"
+          className="btn ghost"
+          onClick={handleEndStage}
+          aria-label={`结束本阶段（${STAGE_LABELS[timer.stage]}），提前进入下一药浴`}
+          data-testid="end-stage-button"
+        >
+          结束本阶段
+        </button>
+        <button
+          type="button"
           className="btn danger ghost"
           onClick={onReset}
           aria-label="重置并放弃当前冲洗"
@@ -210,6 +235,12 @@ export function TimerPanel({ state, now, onPause, onResume, onCalibrate, onAckno
           重置
         </button>
       </div>
+
+      {endStageNotice && (
+        <p className="end-stage-notice" role="alert" data-testid="end-stage-notice">
+          {endStageNotice}
+        </p>
+      )}
 
       <form className="calibrate" onSubmit={submitCalibrate} aria-label="校准剩余时间">
         <label className="calibrate-label" htmlFor="calibrate-input">

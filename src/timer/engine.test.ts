@@ -10,6 +10,7 @@ import {
   agitationView,
   calibrateTimer,
   commitRecord,
+  endStageEarly,
   isPersistedState,
   loadRecord,
   parseAgitationInterval,
@@ -565,6 +566,173 @@ describe('校准剩余时间', () => {
     const viaCalibrate = calibrateTimer(s, 60, T0 + 50 * SECOND)
     expect(viaCalibrate.timer.status).toBe('locked')
     expect(viaCalibrate.agitation).toBeUndefined()
+  })
+})
+
+describe('提前结束本阶段 endStageEarly', () => {
+  it('运行中结束显影：进入停显并按停显完整时长倒数，搅动提示一并清除', () => {
+    const s = startTimer(recipe, T0, 1, undefined, 30)
+    const r = endStageEarly(s, 'develop', T0 + 20 * SECOND)
+    expect(r.ended).toBe(true)
+    expect(r.state.timer).toEqual({
+      status: 'running',
+      stage: 'stop',
+      deadline: T0 + 20 * SECOND + 30 * SECOND,
+    })
+    expect(r.state.agitation).toBeUndefined()
+    expect(r.state.lastWallClock).toBe(T0 + 20 * SECOND)
+  })
+
+  it('运行中结束停显：进入定影并按定影完整时长倒数', () => {
+    const s = runningAt(1, T0, T0 + 30 * SECOND)
+    const r = endStageEarly(s, 'stop', T0 + 10 * SECOND)
+    expect(r.ended).toBe(true)
+    expect(r.state.timer).toEqual({
+      status: 'running',
+      stage: 'fix',
+      deadline: T0 + 10 * SECOND + 300 * SECOND,
+    })
+  })
+
+  it('运行中结束定影：跳过最后阶段直接进入完成结果', () => {
+    const s = runningAt(2, T0, T0 + 300 * SECOND)
+    const r = endStageEarly(s, 'fix', T0 + 100 * SECOND)
+    expect(r.ended).toBe(true)
+    expect(r.state.timer).toEqual({ status: 'done' })
+  })
+
+  it('暂停中结束显影：进入停显后仍暂停并保存停显完整时长，搅动提示清除', () => {
+    const s = pauseTimer(startTimer(recipe, T0, 1, undefined, 30), T0 + 5 * SECOND)
+    const r = endStageEarly(s, 'develop', T0 + 500 * SECOND)
+    expect(r.ended).toBe(true)
+    expect(r.state.timer).toEqual({ status: 'paused', stage: 'stop', remainingMs: 30 * SECOND })
+    expect(r.state.agitation).toBeUndefined()
+    // 暂停期间墙钟前进也不消耗：完整时长原样冻结
+    expect(pausedRemainingSeconds(r.state.timer as Extract<PersistedState['timer'], { status: 'paused' }>)).toBe(30)
+  })
+
+  it('暂停中结束定影：跳过最后阶段直接进入完成结果', () => {
+    const s = pauseTimer(runningAt(2, T0, T0 + 300 * SECOND), T0 + 10 * SECOND)
+    const r = endStageEarly(s, 'fix', T0 + 100 * SECOND)
+    expect(r.ended).toBe(true)
+    expect(r.state.timer).toEqual({ status: 'done' })
+  })
+
+  it('携带的阶段与当前阶段不一致：不越过新阶段，ended=false', () => {
+    // 记录已在停显（另一标签页已结束显影），陈旧面板仍按显影点击
+    const s = runningAt(1, T0, T0 + 30 * SECOND)
+    const r = endStageEarly(s, 'develop', T0 + 5 * SECOND)
+    expect(r.ended).toBe(false)
+    expect(r.state.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 30 * SECOND })
+  })
+
+  it('临界到期：显影已自然到期但记录尚未推进，点击只自然跨入停显，不再额外跳段', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    // T0+65s：显影已耗尽 5s，按墙钟自然落入停显；结束操作不得再跳过停显
+    const r = endStageEarly(s, 'develop', T0 + 65 * SECOND)
+    expect(r.ended).toBe(false)
+    expect(r.state.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 90 * SECOND })
+  })
+
+  it('自然到期穿透全部阶段：结果为完成，ended=false', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    const r = endStageEarly(s, 'develop', T0 + 400 * SECOND)
+    expect(r.ended).toBe(false)
+    expect(r.state.timer).toEqual({ status: 'done' })
+  })
+
+  it('双标签竞态：另一标签已结束显影并提交高 rev，本标签陈旧操作不越过停显', () => {
+    const running = startTimer(recipe, T0, 1)
+    commitRecord(running)
+
+    // 标签 A 结束显影，rev 提升到 2 并提交
+    const endedA = withRev(endStageEarly(running, 'develop', T0 + 10 * SECOND).state, 2)
+    expect(commitRecord(endedA)).toEqual(endedA)
+
+    // 标签 B 的陈旧面板仍显示显影，点击携带 develop：基线从存储读到 rev=2 的停显
+    const stored = loadRecord()
+    expect(stored && isPersistedState(stored)).toBe(true)
+    const r = endStageEarly(stored as PersistedState, 'develop', T0 + 11 * SECOND)
+    expect(r.ended).toBe(false)
+    expect(r.state.timer).toEqual(endedA.timer)
+    // 存储不被这次无效操作改动：仍是停显，绝不会落入定影
+    expect(loadRecord()).toEqual(endedA)
+  })
+
+  it('成功结束以更高 rev 提交后，旧标签的陈旧 running tick 不能覆盖', () => {
+    const running = startTimer(recipe, T0, 1)
+    commitRecord(running)
+
+    const ended = withRev(endStageEarly(running, 'develop', T0 + 10 * SECOND).state, 2)
+    expect(commitRecord(ended)).toEqual(ended)
+
+    // 旧标签拿着 rev=1 的推进写回，被拒
+    expect(commitRecord(advance(running, T0 + 11 * SECOND))).toEqual(ended)
+    const stored = loadRecord()
+    expect(stored).toEqual(ended)
+    if (stored && isPersistedState(stored) && stored.timer.status === 'running') {
+      expect(stored.timer.stage).toBe('stop')
+    } else {
+      expect.unreachable('存储应保持结束显影后的停显记录')
+    }
+  })
+
+  it('时钟回拨时结束操作转为锁定，ended=false', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    s.lastWallClock = T0 + 100 * SECOND
+    const r = endStageEarly(s, 'develop', T0 + 50 * SECOND)
+    expect(r.ended).toBe(false)
+    expect(r.state.timer.status).toBe('locked')
+    if (r.state.timer.status === 'locked') {
+      expect(r.state.timer.observedAt).toBe(T0 + 50 * SECOND)
+    }
+  })
+
+  it('完成态与锁定态不接受结束操作', () => {
+    const done: PersistedState = { ...runningAt(2, T0, T0), timer: { status: 'done' } }
+    const r1 = endStageEarly(done, 'fix', T0 + 1000)
+    expect(r1.ended).toBe(false)
+    expect(r1.state.timer).toEqual({ status: 'done' })
+
+    const locked = advance(runningAt(0, T0, T0 + 60 * SECOND), T0 - 1000)
+    const r2 = endStageEarly(locked, 'develop', T0 + 500 * SECOND)
+    expect(r2.ended).toBe(false)
+    expect(r2.state.timer.status).toBe('locked')
+  })
+
+  it('无搅动字段的旧记录结束显影：正常进入停显，无需迁移', () => {
+    const s = runningAt(0, T0, T0 + 60 * SECOND)
+    expect(s.agitation).toBeUndefined()
+    const r = endStageEarly(s, 'develop', T0 + 20 * SECOND)
+    expect(r.ended).toBe(true)
+    expect(r.state.timer).toEqual({ status: 'running', stage: 'stop', deadline: T0 + 50 * SECOND })
+    expect(r.state.agitation).toBeUndefined()
+  })
+
+  it('结束后的记录可持久化往返：刷新后停显/暂停定影/完成结果保持，继续可用', () => {
+    // 运行中结束显影 → 保存恢复仍是停显
+    const ended = endStageEarly(startTimer(recipe, T0, 1), 'develop', T0 + 10 * SECOND).state
+    saveRecord(ended)
+    expect(loadRecord()).toEqual(ended)
+
+    // 暂停中结束停显 → 恢复仍是暂停的定影（完整时长），继续后按定影全量倒数
+    const pausedStop = pauseTimer(runningAt(1, T0, T0 + 30 * SECOND), T0 + 5 * SECOND)
+    const endedPaused = endStageEarly(pausedStop, 'stop', T0 + 6 * SECOND).state
+    saveRecord(endedPaused)
+    const loaded = loadRecord()
+    expect(loaded && isPersistedState(loaded) && loaded.timer).toEqual({
+      status: 'paused',
+      stage: 'fix',
+      remainingMs: 300 * SECOND,
+    })
+    const resumed = resumeTimer(loaded as PersistedState, T0 + 900 * SECOND)
+    expect(resumed.timer).toEqual({ status: 'running', stage: 'fix', deadline: T0 + 1200 * SECOND })
+
+    // 结束定影 → 恢复仍是完成结果
+    const endedFix = endStageEarly(runningAt(2, T0, T0 + 300 * SECOND), 'fix', T0 + 10 * SECOND).state
+    saveRecord(endedFix)
+    const loadedDone = loadRecord()
+    expect(loadedDone && isPersistedState(loadedDone) && loadedDone.timer).toEqual({ status: 'done' })
   })
 })
 

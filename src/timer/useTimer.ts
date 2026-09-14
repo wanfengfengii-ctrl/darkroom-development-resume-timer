@@ -4,6 +4,7 @@ import {
   advance,
   calibrateTimer,
   commitRecord,
+  endStageEarly,
   isPersistedState,
   loadRecord,
   pauseTimer,
@@ -14,6 +15,7 @@ import {
   STORAGE_KEY,
   type PersistedState,
   type Recipe,
+  type StageId,
   type StoredRecord,
   type TemperatureInfo,
 } from './engine'
@@ -22,8 +24,8 @@ import {
  * 计时器状态机的 React 绑定，支持同一冲洗在多个标签页同时打开：
  *  - 挂载时从 localStorage 恢复并立即按墙钟推进（跨阶段/完成/回拨锁定）
  *  - 运行中每 200ms 按墙钟推进并以相同 rev 提交；暂停/完成/锁定不产生后台写入
- *  - 显式操作（开始/暂停/继续/校准/确认搅动/重置）把 rev +1 后提交（commit）
- *  - 监听 storage 事件：其它标签页暂停/继续/校准/确认搅动/重置后本页立即跟进
+ *  - 显式操作（开始/暂停/继续/校准/确认搅动/结束本阶段/重置）把 rev +1 后提交（commit）
+ *  - 监听 storage 事件：其它标签页暂停/继续/校准/确认搅动/结束本阶段/重置后本页立即跟进
  *  - 提交带 rev 比较：低 rev 的陈旧 running tick 无法覆盖高 rev 的暂停/校准/确认记录；
  *    重置写高 rev 墓碑，旧标签页不能把会话复活
  *  - 页面重新可见时重新从存储读取并补推进（息屏唤醒、后台标签切回）
@@ -36,6 +38,7 @@ export function useTimer(): {
   resume: () => void
   calibrate: (seconds: number) => void
   acknowledge: () => void
+  endStage: (expectedStage: StageId) => boolean
   reset: () => void
 } {
   const recordRef = useRef<StoredRecord | null>(null)
@@ -171,6 +174,31 @@ export function useTimer(): {
     adopt(commitRecord(candidate))
   }, [adopt])
 
+  /**
+   * 提前结束当前药浴：携带点击时面板显示的阶段。状态机先按墙钟消费自然到期，
+   * 仅阶段仍一致才转入下一药浴——显式操作 rev +1 提交，其它标签页经 storage
+   * 事件跟进。阶段已在另一标签页或计时推进中变化时不越过新阶段：采纳较高修订
+   * 记录并返回 false，由界面提示「阶段已更新，未提前结束」。
+   */
+  const endStage = useCallback(
+    (expectedStage: StageId): boolean => {
+      const t = Date.now()
+      setNow(t)
+      const base = loadRecord() ?? recordRef.current
+      if (!base || !isPersistedState(base)) return false
+      const result = endStageEarly(base, expectedStage, t)
+      if (!result.ended) {
+        // 未提前结束：提交/采纳推进后的记录（自然到期跨阶段，或更高 rev 的现存记录）
+        adopt(commitRecord(result.state))
+        return false
+      }
+      const candidate = result.state.rev === base.rev ? withRev(result.state, base.rev + 1) : result.state
+      adopt(commitRecord(candidate))
+      return true
+    },
+    [adopt],
+  )
+
   const reset = useCallback(() => {
     const base = loadRecord() ?? recordRef.current
     const rev = (base ? base.rev : 0) + 1
@@ -179,5 +207,5 @@ export function useTimer(): {
   }, [adopt])
 
   const state = record && isPersistedState(record) ? record : null
-  return { state, now, start, pause, resume, calibrate, acknowledge, reset }
+  return { state, now, start, pause, resume, calibrate, acknowledge, endStage, reset }
 }

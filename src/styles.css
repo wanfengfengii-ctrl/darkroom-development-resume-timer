@@ -421,6 +421,15 @@ form .btn.primary {
   display: flex;
   gap: 12px;
   justify-content: center;
+  flex-wrap: wrap;
+}
+
+/* 结束本阶段：阶段已在别处更新、未提前结束的就地提示 */
+.end-stage-notice {
+  text-align: center;
+  color: var(--amber);
+  font-size: 13px;
+  margin: 12px 0 0;
 }
 
 /* ---- 显影搅动提示 ---- */

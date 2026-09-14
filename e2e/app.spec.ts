@@ -918,3 +918,187 @@ test.describe('时钟回拨保护', () => {
     await expect(page.getByTestId('start-button')).toBeVisible()
   })
 })
+
+test.describe('提前结束本阶段', () => {
+  test('运行中结束显影：进入停显按完整时长倒数，搅动提示清除，刷新后仍在停显', async ({ page }) => {
+    await page.goto('/')
+    await fillRecipe(page, '60', '30', '300')
+    await setAgitation(page, '10')
+    await page.getByTestId('start-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    await expect(page.getByTestId('agitation-prompt')).toHaveAttribute('data-due', 'false')
+
+    // 结束显影：立即进入停显，从停显完整时长（30 秒）倒数
+    await page.getByTestId('end-stage-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('停显')
+    expect(await readSeconds(page)).toBeGreaterThan(29)
+    expect(await readSeconds(page)).toBeLessThanOrEqual(30)
+    // 成功操作不出现「未提前结束」提示
+    await expect(page.getByTestId('end-stage-notice')).toHaveCount(0)
+    // 跳过显影：搅动提示同步清除
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+    await expect(page.getByTestId('agitation-confirm')).toHaveCount(0)
+
+    // 刷新后仍在停显，剩余时间接续而不是重走
+    await page.reload()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('停显')
+    expect(await readSeconds(page)).toBeGreaterThan(25)
+    expect(await readSeconds(page)).toBeLessThanOrEqual(30)
+    await expect(page.getByTestId('agitation-prompt')).toHaveCount(0)
+
+    // 持久化记录中搅动字段已随显影结束清除
+    const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.timer.stage).toBe('stop')
+    expect('agitation' in stored).toBe(false)
+  })
+
+  test('暂停中结束停显：仍暂停并保存定影完整时长，刷新后继续进入定影', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'paused', stage: 'stop', remainingMs: 25_000 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+    await expect(page.getByTestId('current-stage')).toHaveText('停显')
+    await expect(page.getByTestId('seconds')).toHaveText('25')
+
+    // 结束停显：进入定影但仍暂停，保存定影完整时长（300 秒）
+    await page.getByTestId('end-stage-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+    await expect(page.getByTestId('current-stage')).toHaveText('定影')
+    await expect(page.getByTestId('seconds')).toHaveText('300')
+
+    // 刷新后仍是暂停的定影，完整时长不流逝
+    await page.reload()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'paused')
+    await expect(page.getByTestId('current-stage')).toHaveText('定影')
+    await expect(page.getByTestId('seconds')).toHaveText('300')
+    await page.waitForTimeout(1_200)
+    await expect(page.getByTestId('seconds')).toHaveText('300')
+
+    // 继续后从定影完整时长倒数
+    await page.getByTestId('resume-button').click()
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('定影')
+    expect(await readSeconds(page)).toBeGreaterThan(298)
+    expect(await readSeconds(page)).toBeLessThanOrEqual(300)
+  })
+
+  test('结束定影：得到完成结果，刷新后仍完成', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'fix', deadline: now + 300_000 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(page.getByTestId('current-stage')).toHaveText('定影')
+
+    // 跳过定影（最后阶段）：直接得到完成结果
+    await page.getByTestId('end-stage-button').click()
+    await expect(page.getByTestId('done-title')).toBeVisible()
+    await expect(page.getByTestId('end-stage-button')).toHaveCount(0)
+
+    await page.reload()
+    await expect(page.getByTestId('done-title')).toBeVisible()
+    const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.timer.status).toBe('done')
+  })
+
+  test('临界到期：显影已自然到期而面板未推进时点击，只自然推进一次并提示未提前结束', async ({ page }) => {
+    const now = Date.now()
+    // 挂载时显影还有 1.5 秒；随后冻结自动 tick，墙钟越过 deadline 而面板仍停在显影
+    await seedFrozenTicksAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 1_500 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 墙钟越过显影截止时间，但因 tick 冻结，界面尚未推进（仍显示显影阶段）
+    await page.waitForTimeout(2_000)
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 点击结束本阶段：先按墙钟消费自然到期（显影→停显），不再额外跳到定影
+    await page.getByTestId('end-stage-button').click()
+    await expect(page.getByTestId('current-stage')).toHaveText('停显')
+    await expect(page.getByTestId('end-stage-notice')).toHaveText('阶段已更新，未提前结束')
+    let stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.timer.stage).toBe('stop')
+
+    // 面板已与记录一致后再次点击：正常结束停显进入定影，提示消失
+    await page.getByTestId('end-stage-button').click()
+    await expect(page.getByTestId('current-stage')).toHaveText('定影')
+    await expect(page.getByTestId('end-stage-notice')).toHaveCount(0)
+    stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.timer.stage).toBe('fix')
+  })
+
+  test('另一标签页已结束显影：本标签陈旧面板点击不越过停显，采纳较高修订并提示', async ({ page }) => {
+    const now = Date.now()
+    // 冻结 tick：本标签面板停留在显影（模拟尚未同步另一标签提交的陈旧面板）
+    await seedFrozenTicksAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'develop', deadline: now + 60_000 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 另一标签页已结束显影并提交更高 rev 的停显记录（同一文档内写存储不会
+    // 触发本页 storage 事件，且 tick 已冻结，面板保持显影）
+    await page.evaluate((key) => {
+      const record = JSON.parse(localStorage.getItem(key)!)
+      record.rev = record.rev + 1
+      record.timer = { status: 'running', stage: 'stop', deadline: Date.now() + 30_000 }
+      localStorage.setItem(key, JSON.stringify(record))
+    }, STORAGE_KEY)
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+
+    // 陈旧面板点击：不越过停显跳入定影，采纳较高修订的停显记录并提示
+    await page.getByTestId('end-stage-button').click()
+    await expect(page.getByTestId('current-stage')).toHaveText('停显')
+    await expect(page.getByTestId('end-stage-notice')).toHaveText('阶段已更新，未提前结束')
+    const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), STORAGE_KEY)
+    expect(stored.rev).toBe(2)
+    expect(stored.timer.stage).toBe('stop')
+  })
+
+  test('一个标签结束显影后，另一个标签经 storage 事件跟进到停显', async ({ context }) => {
+    // 标签 A：启动冲洗并一直开着
+    const tabA = await context.newPage()
+    await tabA.goto('/')
+    await startRecipe(tabA, '60', '30', '300')
+
+    // 标签 B：打开同一冲洗（从存储恢复为运行中的显影）
+    const tabB = await context.newPage()
+    await tabB.goto('/')
+    await expect(tabB.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+    await expect(tabB.getByTestId('current-stage')).toHaveText('显影')
+
+    // 在 A 结束显影：B 经 storage 事件采纳高 rev 记录，跟进到停显
+    await tabA.getByTestId('end-stage-button').click()
+    await expect(tabA.getByTestId('current-stage')).toHaveText('停显')
+    await expect(tabB.getByTestId('current-stage')).toHaveText('停显')
+    await expect(tabB.getByTestId('panel')).toHaveAttribute('data-status', 'running')
+
+    // B 在新阶段上的操作同样生效：结束停显进入定影，A 也跟进
+    await tabB.getByTestId('end-stage-button').click()
+    await expect(tabB.getByTestId('current-stage')).toHaveText('定影')
+    await expect(tabA.getByTestId('current-stage')).toHaveText('定影')
+
+    await tabA.close()
+    await tabB.close()
+  })
+})
