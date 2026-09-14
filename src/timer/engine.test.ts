@@ -351,6 +351,77 @@ describe('localStorage 持久化往返', () => {
   })
 })
 
+describe('损坏记录拒绝恢复', () => {
+  /** 以一条正常运行记录为基底，覆盖字段后写入，期望恢复被整体拒绝 */
+  const seed = (patch: Record<string, unknown>) => {
+    const base = {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'develop', deadline: T0 + 60 * SECOND },
+      lastWallClock: T0,
+    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...base, ...patch }))
+  }
+
+  it('运行记录的截止时间非数字时拒绝，允许重新开始', () => {
+    seed({ timer: { status: 'running', stage: 'develop', deadline: 'soon' } })
+    expect(loadRecord()).toBeNull()
+
+    // 字符串型非数字（JSON 中 NaN 只能序列化为 null，二者都必须拒绝）
+    localStorage.setItem(
+      STORAGE_KEY,
+      '{"version":1,"rev":1,"recipe":{"develop":60,"stop":30,"fix":300},' +
+        '"timer":{"status":"running","stage":"develop","deadline":"120s"},"lastWallClock":1}',
+    )
+    expect(loadRecord()).toBeNull()
+  })
+
+  it('暂停记录的剩余值非数字时拒绝，回到可重新启动的配方页', () => {
+    seed({ timer: { status: 'paused', stage: 'develop', remainingMs: 'abc' } })
+    expect(loadRecord()).toBeNull()
+  })
+
+  it('缺少定影时长的不完整配方拒绝进入计时面板', () => {
+    seed({ recipe: { develop: 60, stop: 30 } })
+    expect(loadRecord()).toBeNull()
+
+    // 即使已逾期并将跨过停显（旧实现会在定影处算出 NaN），同样拒绝
+    seed({
+      recipe: { develop: 60, stop: 30, fix: null },
+      timer: { status: 'running', stage: 'develop', deadline: T0 - 100 * SECOND },
+      lastWallClock: T0 - 100 * SECOND,
+    })
+    expect(loadRecord()).toBeNull()
+  })
+
+  it('未知阶段标识的运行记录只能拒绝（仅显影/停显/定影可恢复）', () => {
+    seed({ timer: { status: 'running', stage: 'wash', deadline: T0 + 60 * SECOND } })
+    expect(loadRecord()).toBeNull()
+    seed({ timer: { status: 'paused', stage: 'rinse', remainingMs: 40 * SECOND } })
+    expect(loadRecord()).toBeNull()
+  })
+
+  it('lastWallClock 非数字或 timer 结构缺失时拒绝', () => {
+    seed({ lastWallClock: 'now' })
+    expect(loadRecord()).toBeNull()
+    seed({ timer: { status: 'running', stage: 'develop' } })
+    expect(loadRecord()).toBeNull()
+    seed({ timer: { status: 'paused', stage: 'develop', remainingMs: -5 } })
+    expect(loadRecord()).toBeNull()
+  })
+
+  it('done / locked 等合法形状仍可正常恢复', () => {
+    seed({ timer: { status: 'done' } })
+    const done = loadRecord()
+    expect(done && isPersistedState(done) && done.timer.status).toBe('done')
+
+    seed({ timer: { status: 'locked', lastWallClock: T0 + 1000, observedAt: T0 } })
+    const locked = loadRecord()
+    expect(locked && isPersistedState(locked) && locked.timer.status).toBe('locked')
+  })
+})
+
 describe('多标签页 rev 仲裁（跨标签暂停保持）', () => {
   it('低 rev 的陈旧 running tick 不能覆盖高 rev 的暂停记录', () => {
     // 标签 A：运行中 rev=1

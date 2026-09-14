@@ -263,6 +263,55 @@ export function pausedRemainingSeconds(timer: PausedState): number {
 
 // ---- localStorage 序列化 ----
 
+/** 有限整数（拒绝 NaN/Infinity/小数字段，时间戳与时长都必须是整数毫秒/秒） */
+function isFiniteInteger(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v)
+}
+
+/** 阶段标识只能是显影/停显/定影三者之一；未知阶段一律拒绝恢复 */
+function isStageId(v: unknown): v is StageId {
+  return typeof v === 'string' && (STAGE_IDS as readonly string[]).includes(v)
+}
+
+/**
+ * 恢复配方：三阶段时长必须各自为正整数秒。缺少定影时长等不完整配方
+ * 会让逾期穿透后的 deadline 计算变成 NaN，因此禁止其进入计时面板。
+ */
+function reviveRecipe(v: unknown): Recipe | null {
+  if (!v || typeof v !== 'object') return null
+  const r = v as Record<string, unknown>
+  const recipe = {} as Record<StageId, unknown>
+  for (const stage of STAGE_IDS) {
+    const seconds = r[stage]
+    if (!isFiniteInteger(seconds) || seconds < 1) return null
+    recipe[stage] = seconds
+  }
+  return recipe as Recipe
+}
+
+/** 按各状态的形状严格校验 timer，任一字段缺失/非有限值都拒绝 */
+function reviveTimer(v: unknown): TimerState | null {
+  if (!v || typeof v !== 'object') return null
+  const t = v as Record<string, unknown>
+  switch (t.status) {
+    case 'running':
+      // deadline 非数字会导致剩余值与后续阶段 deadline 全部变成 NaN
+      if (!isStageId(t.stage) || !isFiniteInteger(t.deadline)) return null
+      return { status: 'running', stage: t.stage, deadline: t.deadline }
+    case 'paused':
+      // remainingMs 非数字会让暂停时间显示异常，继续后也无法倒数
+      if (!isStageId(t.stage) || !isFiniteInteger(t.remainingMs) || t.remainingMs < 0) return null
+      return { status: 'paused', stage: t.stage, remainingMs: t.remainingMs }
+    case 'done':
+      return { status: 'done' }
+    case 'locked':
+      if (!isFiniteInteger(t.lastWallClock) || !isFiniteInteger(t.observedAt)) return null
+      return { status: 'locked', lastWallClock: t.lastWallClock, observedAt: t.observedAt }
+    default:
+      return null
+  }
+}
+
 function revive(raw: string): StoredRecord | null {
   let parsed: unknown
   try {
@@ -272,11 +321,15 @@ function revive(raw: string): StoredRecord | null {
   }
   if (!parsed || typeof parsed !== 'object') return null
   const r = parsed as Record<string, unknown>
-  if (r.version !== 1 || typeof r.rev !== 'number' || !Number.isFinite(r.rev)) return null
+  if (r.version !== 1 || !isFiniteInteger(r.rev)) return null
   if (r.reset === true) return { version: 1, rev: r.rev, reset: true }
-  const p = parsed as Partial<PersistedState>
-  if (!p.timer || typeof p.lastWallClock !== 'number' || !p.recipe) return null
-  return p as PersistedState
+
+  // 任何字段损坏（非数字时间、不完整配方、未知阶段）都整体拒绝，
+  // 让调用方回到配方页允许重新开始，而不是把 NaN 带进状态机与面板。
+  const recipe = reviveRecipe(r.recipe)
+  const timer = reviveTimer(r.timer)
+  if (!recipe || !timer || !isFiniteInteger(r.lastWallClock)) return null
+  return { version: 1, rev: r.rev, recipe, timer, lastWallClock: r.lastWallClock }
 }
 
 export function loadRecord(): StoredRecord | null {

@@ -300,6 +300,68 @@ test.describe('冲洗完成', () => {
   })
 })
 
+test.describe('损坏记录拒绝恢复', () => {
+  test('非数字截止时间的运行记录被拒绝，回到配方页可重新开始', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'develop', deadline: 'soon' },
+      lastWallClock: now,
+    })
+    // 绝不进入显示 NaN 的计时面板
+    await expect(page.getByTestId('panel')).toHaveCount(0)
+    await expect(page.getByTestId('start-button')).toBeVisible()
+
+    // 重新开始后倒计时正常，剩余值为数字并随时间递减
+    await startRecipe(page, '3', '2', '2')
+    await expect(page.getByTestId('current-stage')).toHaveText('显影')
+    const seconds = Number((await page.getByTestId('seconds').textContent())!.trim())
+    expect(Number.isFinite(seconds)).toBe(true)
+  })
+
+  test('非数字剩余值的暂停记录被拒绝，回到可重新启动的配方页', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'paused', stage: 'develop', remainingMs: 'abc' },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('panel')).toHaveCount(0)
+    await expect(page.getByTestId('start-button')).toBeVisible()
+  })
+
+  test('缺少定影时长且逾期跨过停显的不完整配方被拒绝，不进入计时面板', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30 }, // 缺少 fix：旧实现会在定影处算出 NaN
+      timer: { status: 'running', stage: 'develop', deadline: now - 100_000 },
+      lastWallClock: now - 100_000,
+    })
+    await expect(page.getByTestId('panel')).toHaveCount(0)
+    await expect(page.getByTestId('start-button')).toBeVisible()
+  })
+
+  test('未知阶段标识的运行记录被拒绝，只允许恢复显影/停显/定影', async ({ page }) => {
+    const now = Date.now()
+    await seedAndReload(page, {
+      version: 1,
+      rev: 1,
+      recipe: { develop: 60, stop: 30, fix: 300 },
+      timer: { status: 'running', stage: 'wash', deadline: now + 60_000 },
+      lastWallClock: now,
+    })
+    await expect(page.getByTestId('panel')).toHaveCount(0)
+    await expect(page.getByTestId('current-stage')).toHaveCount(0)
+    await expect(page.getByTestId('start-button')).toBeVisible()
+  })
+})
+
 test.describe('时钟回拨保护', () => {
   test('墙钟早于最近记录立即锁定并说明，只有重置可清除', async ({ page }) => {
     const now = Date.now()
